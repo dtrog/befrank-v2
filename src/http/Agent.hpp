@@ -1,12 +1,16 @@
+// Copyright (c) 2012-2018, The CryptoNote developers, The Bytecoin developers.
+// Licensed under the GNU Lesser General Public License. See LICENSE for details.
+
 #pragma once
 
-#include <memory>
 #include <algorithm>
+#include <chrono>
 #include <deque>
+#include <memory>
 #include <set>
-#include "platform/Network.hpp"
-#include "common/MemoryStreams.hpp"
 #include "ResponseParser.hpp"
+#include "common/MemoryStreams.hpp"
+#include "platform/Network.hpp"
 
 namespace http {
 
@@ -25,6 +29,7 @@ class Agent {
 		void write(RequestData &&response);
 
 		void disconnect();
+
 	private:
 		common::CircularBuffer buffer;
 		std::deque<common::StringStream> responses;
@@ -55,18 +60,18 @@ class Agent {
 	uint16_t port;
 	Connection client;
 	platform::Timer reconnect_timer;
+	std::chrono::steady_clock::time_point request_start;
 
-	void send_request();
 	void on_client_response();
 	void on_client_disconnect();
 	void on_reconnect_timer();
 
 	void set_request(Request *req);
 	void cancel_request(Request *req);
+
 public:
 	Agent(const std::string &address, uint16_t port);
 	~Agent();
-	bool disconnected_for_long_time() const;
 };
 
 class Request {
@@ -76,13 +81,12 @@ public:
 
 	Request(Agent &agent, RequestData &&req, R_handler r_handler, E_handler e_handler);
 	~Request();
+
 private:
 	friend class Agent;
 	Agent &agent;
-    RequestData req;
+	RequestData req;
 	R_handler r_handler;
 	E_handler e_handler;
 };
-
 }
-
