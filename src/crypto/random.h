@@ -3,18 +3,16 @@
 
 #pragma once
 
-#if !defined(__cplusplus)
 #include <stddef.h>
-#endif
 
 #if defined(__cplusplus)
-namespace crypto { extern "C" {
+extern "C" {
 #endif
 
-void unsafe_generate_random_bytes(size_t n, void *result); // Not thread-safe
-void initialize_random(void);
-void initialize_random_for_tests(void);
+void crypto_unsafe_generate_random_bytes(unsigned char *result, size_t n);  // Not thread-safe
+void crypto_initialize_random(void);
+void crypto_initialize_random_for_tests(void);
 
 #if defined(__cplusplus)
-}}
+}
 #endif

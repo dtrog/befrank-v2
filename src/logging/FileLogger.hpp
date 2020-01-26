@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <memory>
 #include <mutex>
 #include "CommonLogger.hpp"
 #include "platform/Files.hpp"
@@ -24,4 +25,4 @@ private:
 	const std::string fullfilenamenoext;
 	std::unique_ptr<platform::FileStream> file_stream;
 };
-}
+}  // namespace logging

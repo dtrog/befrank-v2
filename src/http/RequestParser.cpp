@@ -7,9 +7,9 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include "RequestParser.hpp"
-#include <boost/lexical_cast.hpp>
 #include <cctype>
 #include <sstream>
+#include "common/Math.hpp"
 
 using namespace http;
 
@@ -20,7 +20,7 @@ void RequestParser::reset() {
 	lowcase = Header{};
 }
 
-RequestParser::state RequestParser::consume(request &req, char input) {
+RequestParser::state RequestParser::consume(RequestHeader &req, char input) {
 	switch (state_) {
 	case method_start:
 		if (!is_char(input) || is_ctl(input) || is_tspecial(input))
@@ -158,18 +158,23 @@ RequestParser::state RequestParser::consume(request &req, char input) {
 	}
 }
 
-bool RequestParser::process_ready_header(request &req) {
+bool RequestParser::process_ready_header(RequestHeader &req) {
 	if (lowcase.name == "content-length") {
 		try {
-			req.content_length = boost::lexical_cast<decltype(req.content_length)>(lowcase.value);  // std::stoull
+			req.content_length = common::integer_cast<decltype(req.content_length)>(lowcase.value);  // std::stoull
 			req.headers.pop_back();
 			return true;
-		} catch (...) {
+		} catch (const std::exception &) {
 		}
 		return false;
 	}
 	if (lowcase.name == "host") {
 		req.host = lowcase.value;
+		req.headers.pop_back();
+		return true;
+	}
+	if (lowcase.name == "origin") {
+		req.origin = lowcase.value;
 		req.headers.pop_back();
 		return true;
 	}

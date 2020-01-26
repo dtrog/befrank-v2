@@ -8,48 +8,50 @@
 #include "crypto/hash.hpp"
 #include "seria/BinaryOutputStream.hpp"
 
-namespace bytecoin {
+namespace cn {
 
-template<class T>
-Hash get_object_hash(const T &object, size_t *size = nullptr) {
-	BinaryArray ba = seria::to_binary(object);
+template<class T, typename... Context>
+Hash get_object_hash(const T &object, size_t *size, Context... context) {
+	BinaryArray ba = seria::to_binary(object, context...);
 	if (size)
 		*size = ba.size();
 	return crypto::cn_fast_hash(ba.data(), ba.size());
 }
 
-Hash get_base_transaction_hash(const BaseTransaction &tx);
+Hash get_root_block_base_transaction_hash(const RootBaseTransaction &tx);
+
+void set_root_extra_to_solo_mining_tag(BlockTemplate &block);  // MM headers must still have valid mm_tag if solo mining
 
 void decompose_amount(Amount amount, Amount dust_threshold, std::vector<Amount> *decomposed_amounts);
-size_t get_maximum_tx_size(size_t input_count, size_t output_count, size_t mixin_count);
 
-bool get_tx_fee(const Transaction &tx, uint64_t *fee);
-uint64_t get_tx_fee(const Transaction &tx);
+// Size is counted with corressponding signatures
+const size_t MIN_NONCOINBASE_TRANSACTION_SIZE = 140;  // It is better to underestimate it
 
-struct ParentBlockSerializer {
-	ParentBlockSerializer(
-	    ParentBlock &parent_block, Timestamp &timestamp, uint32_t &nonce, bool hashing_serialization, bool header_only)
-	    : m_parent_block(parent_block)
-	    , m_timestamp(timestamp)
-	    , m_nonce(nonce)
-	    , m_hashing_serialization(hashing_serialization)
-	    , m_header_only(header_only) {}
-	ParentBlock &m_parent_block;
-	Timestamp &m_timestamp;
-	uint32_t &m_nonce;
-	bool m_hashing_serialization;
-	bool m_header_only;
-};
+size_t get_maximum_tx_size_amethyst(size_t input_count, size_t output_count, size_t anonymity);
+size_t get_maximum_tx_input_count_amethyst(size_t tx_size, size_t output_count, size_t anonymity);
+size_t get_maximum_tx_size_jade(size_t input_count, size_t output_count, size_t anonymity);
+size_t get_maximum_tx_input_count_jade(size_t tx_size, size_t output_count, size_t anonymity);
 
-inline ParentBlockSerializer make_parent_block_serializer(
-    const BlockTemplate &b, bool hashing_serialization, bool header_only) {
-	BlockTemplate &block_ref = const_cast<BlockTemplate &>(b);
-	return ParentBlockSerializer(
-	    block_ref.parent_block, block_ref.timestamp, block_ref.nonce, hashing_serialization, header_only);
-}
+Amount get_tx_sum_outputs(const TransactionPrefix &tx);
+Amount get_tx_sum_inputs(const TransactionPrefix &tx);
+
+size_t get_tx_key_outputs_count(const TransactionPrefix &tx);
+
+inline bool add_amount(Amount &sum, Amount amount) {
+	if (std::numeric_limits<Amount>::max() - amount < sum)
+		return false;
+	sum += amount;
+	return true;
 }
 
-namespace seria {
-class ISeria;
-void ser_members(bytecoin::ParentBlockSerializer &v, ISeria &s);
-}
+bool get_tx_fee(const TransactionPrefix &tx, Amount *fee);
+Amount get_tx_fee(const TransactionPrefix &tx);
+
+std::vector<size_t> absolute_output_offsets_to_relative(const std::vector<size_t> &off);
+bool relative_output_offsets_to_absolute(std::vector<size_t> *result, const std::vector<size_t> &off);
+
+BlockBodyProxy get_body_proxy_from_template(
+    const Hash &base_transaction_hash, const std::vector<Hash> &transaction_hashes);
+BlockBodyProxy get_body_proxy_from_template(const BlockTemplate &bt);
+
+}  // namespace cn

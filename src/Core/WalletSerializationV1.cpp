@@ -1,10 +1,10 @@
 // Copyright (c) 2012-2018, The CryptoNote developers, The Bytecoin developers.
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
-#include "WalletSerializationV1.h"
-#include <crypto/crypto.hpp>
+#include "WalletSerializationV1.hpp"
 #include "CryptoNoteTools.hpp"
 #include "common/MemoryStreams.hpp"
+#include "crypto/crypto.hpp"
 #include "seria/BinaryInputStream.hpp"
 
 using namespace common;
@@ -29,7 +29,7 @@ struct ObsoleteSpentOutputDto {
 	Hash transaction_hash;
 	uint32_t output_in_transaction;
 	uint64_t wallet_index;
-	crypto::Hash spending_transaction_hash;
+	Hash spending_transaction_hash;
 };
 
 // DO NOT CHANGE IT
@@ -49,7 +49,7 @@ struct UnlockTransactionJobDto {
 /*struct WalletTransactionDto {
         WalletTransactionDto() {}
 
-        WalletTransactionDto(const bytecoin::WalletTransaction &wallet) {
+        WalletTransactionDto(const cn::WalletTransaction &wallet) {
                 state         = wallet.state;
                 timestamp     = wallet.timestamp;
                 block_height  = wallet.block_height;
@@ -57,18 +57,18 @@ struct UnlockTransactionJobDto {
                 total_amount  = wallet.total_amount;
                 fee           = wallet.fee;
                 creation_time = wallet.creation_time;
-                unlock_time   = wallet.unlock_time;
+                unlock_block_or_timestamp   = wallet.unlock_block_or_timestamp;
                 extra         = wallet.extra;
         }
 
-        bytecoin::WalletTransactionState state;
+        cn::WalletTransactionState state;
         uint64_t timestamp;
         uint32_t block_height;
         Hash hash;
         int64_t total_amount;
         uint64_t fee;
         uint64_t creation_time;
-        uint64_t unlock_time;
+        uint64_t unlock_block_or_timestamp;
         std::string extra;
 };
 
@@ -76,7 +76,7 @@ struct UnlockTransactionJobDto {
 struct WalletTransferDto {
         explicit WalletTransferDto(uint32_t version) : amount(0), type(0),
 version(version) {}
-        WalletTransferDto(const bytecoin::WalletTransfer &tr, uint32_t version)
+        WalletTransferDto(const cn::WalletTransfer &tr, uint32_t version)
 : WalletTransferDto(version) {
                 address = tr.address;
                 amount  = tr.amount;
@@ -88,9 +88,9 @@ version(version) {}
         uint8_t type;
 
         uint32_t version;
-};*/
+};
 
-/*void serialize(WalletRecordDto &v, bytecoin::ISerializer &s) {
+void serialize(WalletRecordDto &v, cn::ISerializer &s) {
         s(v.spend_public_key, "spend_public_key");
         s(v.spend_secret_key, "spend_secret_key");
         s(v.pending_balance, "pending_balance");
@@ -101,23 +101,23 @@ version(version) {}
 struct KeysStorage {
 	uint64_t creation_timestamp;
 
-	crypto::PublicKey spend_public_key;
-	crypto::SecretKey spend_secret_key;
+	PublicKey spend_public_key;
+	SecretKey spend_secret_key;
 
-	crypto::PublicKey view_public_key;
-	crypto::SecretKey view_secret_key;
+	PublicKey view_public_key;
+	SecretKey view_secret_key;
 };
 
 std::string read_cipher(common::IInputStream &source, const std::string &name) {
 	std::string cipher;
-	//	bytecoin::BinaryInputStreamSerializer s(source);
+	//	cn::BinaryInputStreamSerializer s(source);
 	seria::BinaryInputStream s(source);
-	s(cipher);  // , name
+	ser(cipher, s);  // , name
 
 	return cipher;
 }
 
-std::string decrypt(const std::string &cipher, bytecoin::WalletSerializerV1::CryptoContext &crypto_ctx) {
+std::string decrypt(const std::string &cipher, cn::WalletSerializerV1::CryptoContext &crypto_ctx) {
 	std::string plain;
 	plain.resize(cipher.size());
 
@@ -129,12 +129,12 @@ template<typename Object>
 void deserialize(Object &obj, const std::string &name, const std::string &plain) {
 	MemoryInputStream stream(plain.data(), plain.size());
 	seria::BinaryInputStream s(stream);
-	s(obj);
+	ser(obj, s);
 }
 
 template<typename Object>
-void deserialize_encrypted(Object &obj, const std::string &name,
-    bytecoin::WalletSerializerV1::CryptoContext &crypto_ctx, common::IInputStream &source) {
+void deserialize_encrypted(Object &obj, const std::string &name, cn::WalletSerializerV1::CryptoContext &crypto_ctx,
+    common::IInputStream &source) {
 	std::string cipher = read_cipher(source, name);
 	std::string plain  = decrypt(cipher, crypto_ctx);
 
@@ -144,7 +144,7 @@ void deserialize_encrypted(Object &obj, const std::string &name,
 }  // anonymous namespace
 
 namespace seria {
-void ser(crypto::chacha8_iv &v, ISeria &s) { s.binary(v.data, sizeof(v.data)); }
+bool ser(crypto::chacha_iv &v, ISeria &s) { return s.binary(v.data, sizeof(v.data)); }
 void ser_members(WalletRecordDto &v, ISeria &s) {
 	seria_kv("spend_public_key", v.spend_public_key, s);
 	seria_kv("spend_secret_key", v.spend_secret_key, s);
@@ -159,9 +159,9 @@ void ser_members(KeysStorage &v, ISeria &s) {
 	seria_kv("view_public_key", v.view_public_key, s);
 	seria_kv("view_secret_key", v.view_secret_key, s);
 }
-}
+}  // namespace seria
 
-namespace bytecoin {
+namespace cn {
 
 const uint32_t WalletSerializerV1::SERIALIZATION_VERSION = 5;
 
@@ -174,7 +174,7 @@ WalletSerializerV1::WalletSerializerV1(crypto::PublicKey &view_public_key, crypt
     std::vector<WalletRecord> &wallets_container)
     : m_view_public_key(view_public_key), m_view_secret_key(view_secret_key), m_wallets_container(wallets_container) {}
 
-void WalletSerializerV1::load(const crypto::chacha8_key &key, common::IInputStream &source) {
+void WalletSerializerV1::load(const crypto::chacha_key &key, common::IInputStream &source) {
 	seria::BinaryInputStream s(source);
 	s.begin_object();
 
@@ -191,7 +191,7 @@ void WalletSerializerV1::load(const crypto::chacha8_key &key, common::IInputStre
 	s.end_object();
 }
 
-void WalletSerializerV1::load_wallet(common::IInputStream &source, const crypto::chacha8_key &key, uint32_t version) {
+void WalletSerializerV1::load_wallet(common::IInputStream &source, const crypto::chacha_key &key, uint32_t version) {
 	CryptoContext crypto_ctx;
 
 	load_iv(source, crypto_ctx.iv);
@@ -203,16 +203,16 @@ void WalletSerializerV1::load_wallet(common::IInputStream &source, const crypto:
 	load_wallets(source, crypto_ctx);
 }
 
-void WalletSerializerV1::load_wallet_v1(common::IInputStream &source, const crypto::chacha8_key &key) {
+void WalletSerializerV1::load_wallet_v1(common::IInputStream &source, const crypto::chacha_key &key) {
 	CryptoContext crypto_ctx;
 
 	seria::BinaryInputStream encrypted(source);
 
-	encrypted(crypto_ctx.iv);
+	ser(crypto_ctx.iv, encrypted);
 	crypto_ctx.key = key;
 
 	std::string cipher;
-	encrypted(cipher);
+	ser(cipher, encrypted);
 
 	std::string plain = decrypt(cipher, crypto_ctx);
 
@@ -223,16 +223,16 @@ void WalletSerializerV1::load_wallet_v1(common::IInputStream &source, const cryp
 	check_keys();
 
 	bool details_saved;
-	serializer(details_saved);  // , "has_details"
+	ser(details_saved, serializer);  // , "has_details"
 }
 
 void WalletSerializerV1::load_wallet_v1_keys(seria::ISeria &s) {
 	KeysStorage keys;
 
 	try {
-		s(keys);
-	} catch (const std::runtime_error &) {
-		throw std::runtime_error("WRONG_PASSWORD");
+		ser(keys, s);
+	} catch (const std::exception &) {
+		std::throw_with_nested(std::runtime_error("WRONG_PASSWORD"));
 	}
 
 	m_view_public_key = keys.view_public_key;
@@ -250,12 +250,12 @@ uint32_t WalletSerializerV1::load_version(common::IInputStream &source) {
 	seria::BinaryInputStream s(source);
 
 	uint32_t version = std::numeric_limits<uint32_t>::max();
-	s(version);
+	ser(version, s);
 
 	return version;
 }
 
-void WalletSerializerV1::load_iv(common::IInputStream &source, crypto::chacha8_iv &iv) {
+void WalletSerializerV1::load_iv(common::IInputStream &source, crypto::chacha_iv &iv) {
 	seria::BinaryInputStream s(source);
 
 	s.binary(static_cast<void *>(&iv.data), sizeof(iv.data));  // , "chacha_iv"
@@ -265,8 +265,8 @@ void WalletSerializerV1::load_keys(common::IInputStream &source, CryptoContext &
 	try {
 		load_public_key(source, crypto_ctx);
 		load_secret_key(source, crypto_ctx);
-	} catch (const std::runtime_error &) {
-		throw std::runtime_error("WRONG_PASSWORD");
+	} catch (const std::exception &) {
+		std::throw_with_nested(std::runtime_error("WRONG_PASSWORD"));
 	}
 }
 
@@ -319,7 +319,7 @@ void WalletSerializerV1::load_wallets(common::IInputStream &source, CryptoContex
 			if (!keys_match(dto.spend_secret_key, dto.spend_public_key))
 				throw std::runtime_error("Restored spend public key doesn't correspond to secret key");
 		} else {
-			if (!crypto::key_isvalid(dto.spend_public_key)) {
+			if (!crypto::key_in_main_subgroup(dto.spend_public_key)) {
 				throw std::runtime_error("WRONG_PASSWORD - Public spend key is incorrect");
 			}
 		}
@@ -333,4 +333,4 @@ void WalletSerializerV1::load_wallets(common::IInputStream &source, CryptoContex
 	}
 }
 
-}  // namespace bytecoin
+}  // namespace cn

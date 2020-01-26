@@ -2,22 +2,43 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include "CryptoNoteTools.hpp"
+#include <crypto/crypto.hpp>
+#include "CryptoNoteConfig.hpp"
 #include "TransactionExtra.hpp"
+#include "common/StringTools.hpp"
+#include "common/Varint.hpp"
 #include "seria/ISeria.hpp"
 
-using namespace bytecoin;
+using namespace cn;
 
-Hash bytecoin::get_base_transaction_hash(const BaseTransaction &tx) {
+Hash cn::get_root_block_base_transaction_hash(const RootBaseTransaction &tx) {
 	if (tx.version < 2)
-		return get_object_hash(tx);
-	BinaryArray data{{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbc, 0x36,
-	    0x78, 0x9e, 0x7a, 0x1e, 0x28, 0x14, 0x36, 0x46, 0x42, 0x29, 0x82, 0x8f, 0x81, 0x7d, 0x66, 0x12, 0xf7, 0xb4,
-	    0x77, 0xd6, 0x65, 0x91, 0xff, 0x96, 0xa9, 0xe0, 0x64, 0xbc, 0xc9, 0x8a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}};
-	*reinterpret_cast<Hash *>(data.data()) = get_object_hash(static_cast<const TransactionPrefix &>(tx));
-	return crypto::cn_fast_hash(data.data(), data.size());
+		return get_object_hash(tx, nullptr);
+	// XMR(XMO) as popular MM root, see details in monero/src/cryptonote_basic/cryptonote_format_utils.cpp
+	// bc36789e7a1e281436464229828f817d6612f7b477d66591ff96a9e064bcc98a = hash(1 zero byte (RCTTypeNull))
+	crypto::KeccakStream hasher;
+	static const unsigned char append_data[64] = {0xbc, 0x36, 0x78, 0x9e, 0x7a, 0x1e, 0x28, 0x14, 0x36, 0x46, 0x42,
+	    0x29, 0x82, 0x8f, 0x81, 0x7d, 0x66, 0x12, 0xf7, 0xb4, 0x77, 0xd6, 0x65, 0x91, 0xff, 0x96, 0xa9, 0xe0, 0x64,
+	    0xbc, 0xc9, 0x8a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	const Hash ha = get_object_hash(static_cast<const TransactionPrefix &>(tx), nullptr, true);
+	hasher.append(ha);
+	hasher.append(append_data, sizeof(append_data));
+	return hasher.cn_fast_hash();
+}
+
+void cn::set_root_extra_to_solo_mining_tag(BlockTemplate &block) {
+	if (block.is_merge_mined()) {
+		block.root_block                              = RootBlock{};
+		block.root_block.timestamp                    = block.timestamp;
+		block.root_block.major_version                = 1;
+		block.root_block.transaction_count            = 1;
+		block.root_block.coinbase_transaction.version = 1;
+
+		extra::MergeMiningTag mmTag;
+		mmTag.merkle_root = get_block_header_prehash(block, get_body_proxy_from_template(block));
+		extra::add_merge_mining_tag(block.root_block.coinbase_transaction.extra, mmTag);
+	}
 }
 
 // 62387455827 -> 455827 + 7000000 + 80000000 + 300000000 + 2000000000 +
@@ -56,134 +77,155 @@ void decompose_amount_into_digits(
 	}
 }
 
-void bytecoin::decompose_amount(Amount amount, Amount dust_threshold, std::vector<Amount> *decomposed_amounts) {
+void cn::decompose_amount(Amount amount, Amount dust_threshold, std::vector<Amount> *decomposed_amounts) {
 	decompose_amount_into_digits(amount, dust_threshold, [&](Amount amount) { decomposed_amounts->push_back(amount); },
 	    [&](Amount dust) {
+		    // This code will work relatively well for any dust_threshold <= 6
 		    Amount du0 = dust % 1000;
 		    Amount du1 = dust - du0;
-		    if (du0 != 0)
-			    decomposed_amounts->push_back(du0);
 		    if (du1 != 0)
 			    decomposed_amounts->push_back(du1);
-		});
+		    if (du0 != 0)
+			    decomposed_amounts->push_back(du0);
+	    });
 }
 
-size_t bytecoin::get_maximum_tx_size(size_t input_count, size_t output_count, size_t mixin_count) {
-	const size_t KEY_IMAGE_SIZE                    = sizeof(crypto::KeyImage);
-	const size_t OUTPUT_KEY_SIZE                   = sizeof(crypto::PublicKey);
-	const size_t AMOUNT_SIZE                       = sizeof(uint64_t) + 2;  // varint
-	const size_t GLOBAL_INDEXES_VECTOR_SIZE_SIZE   = sizeof(uint8_t);       // varint
-	const size_t GLOBAL_INDEXES_INITIAL_VALUE_SIZE = sizeof(uint32_t);      // varint
-	const size_t GLOBAL_INDEXES_DIFFERENCE_SIZE    = sizeof(uint32_t);      // varint
-	const size_t SIGNATURE_SIZE                    = sizeof(crypto::Signature);
-	const size_t EXTRA_TAG_SIZE                    = sizeof(uint8_t);
-	const size_t INPUT_TAG_SIZE                    = sizeof(uint8_t);
-	const size_t OUTPUT_TAG_SIZE                   = sizeof(uint8_t);
-	const size_t PUBLIC_KEY_SIZE                   = sizeof(crypto::PublicKey);
-	const size_t TRANSACTION_VERSION_SIZE          = sizeof(uint8_t);
-	const size_t TRANSACTION_UNLOCK_TIME_SIZE      = sizeof(uint64_t);
+const size_t KEY_IMAGE_SIZE                    = sizeof(KeyImage);
+const size_t OUTPUT_KEY_SIZE                   = sizeof(PublicKey);
+const size_t OUTPUT_SECRET_SIZE                = sizeof(PublicKey);
+const size_t OUTPUT_AMOUNT_COMMITMENT_SIZE     = sizeof(PublicKey);
+const size_t AMOUNT_SIZE                       = sizeof(uint64_t) + 2;  // varint
+const size_t IO_COUNT_SIZE                     = 3;                     // varint
+const size_t GLOBAL_INDEXES_VECTOR_SIZE_SIZE   = 1;                     // varint
+const size_t GLOBAL_INDEXES_INITIAL_VALUE_SIZE = sizeof(size_t);        // varint
+const size_t GLOBAL_INDEXES_DIFFERENCE_SIZE    = sizeof(size_t);        // varint
+const size_t INPUT_TAG_SIZE                    = 1;
+const size_t OUTPUT_TAG_SIZE                   = 1;
+const size_t TRANSACTION_VERSION_SIZE          = 1;
+const size_t TRANSACTION_UNLOCK_TIME_SIZE      = sizeof(uint64_t) + 2;  // varint
+const size_t TRANSACTION_FEE_SIZE              = sizeof(uint64_t) + 2;  // varint
+const size_t AMETHYST_SIGNATURE_C0_SIZE        = sizeof(SecretKey);
+const size_t AMETHYST_SIGNATURE_PER_INPUT_SIZE = 2 * sizeof(SecretKey) + sizeof(PublicKey);
+const size_t AMETHYST_SIGNATURE_PER_MIXIN_SIZE = sizeof(SecretKey);
 
-	const size_t outputs_size = output_count * (OUTPUT_TAG_SIZE + OUTPUT_KEY_SIZE + AMOUNT_SIZE);
-	const size_t header_size =
-	    TRANSACTION_VERSION_SIZE + TRANSACTION_UNLOCK_TIME_SIZE + EXTRA_TAG_SIZE + PUBLIC_KEY_SIZE;
-	const size_t input_size = INPUT_TAG_SIZE + AMOUNT_SIZE + KEY_IMAGE_SIZE + SIGNATURE_SIZE +
-	                          GLOBAL_INDEXES_VECTOR_SIZE_SIZE + GLOBAL_INDEXES_INITIAL_VALUE_SIZE +
-	                          mixin_count * (GLOBAL_INDEXES_DIFFERENCE_SIZE + SIGNATURE_SIZE);
-	return header_size + outputs_size + input_size * input_count;
+const size_t tx_fixed_size_amethyst =
+    TRANSACTION_VERSION_SIZE + TRANSACTION_UNLOCK_TIME_SIZE + 3 * IO_COUNT_SIZE + AMETHYST_SIGNATURE_C0_SIZE;
+const size_t tx_fixed_size_jade      = tx_fixed_size_amethyst + TRANSACTION_FEE_SIZE;
+const size_t tx_output_size_amethyst = OUTPUT_TAG_SIZE + 1 + OUTPUT_KEY_SIZE + OUTPUT_SECRET_SIZE + AMOUNT_SIZE;
+const size_t tx_output_size_jade     = tx_output_size_amethyst + OUTPUT_AMOUNT_COMMITMENT_SIZE;
+
+static size_t get_maximum_tx_input_size_amethyst(size_t anonymity) {
+	const size_t fixed_part = INPUT_TAG_SIZE + AMOUNT_SIZE + KEY_IMAGE_SIZE + GLOBAL_INDEXES_VECTOR_SIZE_SIZE +
+	                          GLOBAL_INDEXES_INITIAL_VALUE_SIZE + AMETHYST_SIGNATURE_PER_INPUT_SIZE;
+	return fixed_part + (anonymity + 1) * (GLOBAL_INDEXES_DIFFERENCE_SIZE + AMETHYST_SIGNATURE_PER_MIXIN_SIZE);
+}
+static size_t get_maximum_tx_input_size_jade(size_t anonymity) {
+	// TODO - modify for jade
+	return get_maximum_tx_input_size_amethyst(anonymity);
+}
+size_t cn::get_maximum_tx_size_amethyst(size_t input_count, size_t output_count, size_t anonymity) {
+	const size_t outputs_size = output_count * tx_output_size_amethyst;
+	const size_t inputs_size  = input_count * get_maximum_tx_input_size_amethyst(anonymity);
+	return tx_fixed_size_amethyst + outputs_size + inputs_size;
+}
+size_t cn::get_maximum_tx_input_count_amethyst(size_t tx_size, size_t output_count, size_t anonymity) {
+	const size_t outputs_size = output_count * tx_output_size_amethyst;
+	if (tx_size < tx_fixed_size_amethyst + outputs_size)
+		return 0;
+	return (tx_size - tx_fixed_size_amethyst - outputs_size) / get_maximum_tx_input_size_amethyst(anonymity);
+}
+size_t cn::get_maximum_tx_size_jade(size_t input_count, size_t output_count, size_t anonymity) {
+	const size_t outputs_size = output_count * tx_output_size_jade;
+	const size_t inputs_size  = input_count * get_maximum_tx_input_size_jade(anonymity);
+	return tx_fixed_size_jade + outputs_size + inputs_size;
+}
+size_t cn::get_maximum_tx_input_count_jade(size_t tx_size, size_t output_count, size_t anonymity) {
+	const size_t outputs_size = output_count * tx_output_size_jade;
+	if (tx_size < tx_fixed_size_jade + outputs_size)
+		return 0;
+	return (tx_size - tx_fixed_size_jade - outputs_size) / get_maximum_tx_input_size_jade(anonymity);
 }
 
-bool bytecoin::get_tx_fee(const Transaction &tx, uint64_t *fee) {
-	uint64_t amount_in  = 0;
+Amount cn::get_tx_sum_outputs(const TransactionPrefix &tx) {
 	uint64_t amount_out = 0;
-
-	for (const auto &in : tx.inputs) {
-		if (in.type() == typeid(KeyInput)) {
-			amount_in += boost::get<KeyInput>(in).amount;
-		}
+	for (const auto &output : tx.outputs) {
+		if (const auto *out = boost::get<OutputKey>(&output))
+			amount_out += out->amount;
 	}
-
-	for (const auto &o : tx.outputs) {
-		amount_out += o.amount;
+	return amount_out;
+}
+Amount cn::get_tx_sum_inputs(const TransactionPrefix &tx) {
+	uint64_t amount_in = 0;
+	for (const auto &input : tx.inputs) {
+		if (const auto *in = boost::get<InputKey>(&input))
+			amount_in += in->amount;
 	}
+	return amount_in;
+}
 
-	if (!(amount_in >= amount_out)) {
+size_t cn::get_tx_key_outputs_count(const TransactionPrefix &tx) {
+	size_t count = 0;
+	for (const auto &output : tx.outputs) {
+		if (boost::get<OutputKey>(&output))
+			count += 1;
+	}
+	return count;
+}
+
+bool cn::get_tx_fee(const TransactionPrefix &tx, uint64_t *fee) {
+	uint64_t amount_in  = get_tx_sum_inputs(tx);
+	uint64_t amount_out = get_tx_sum_outputs(tx);
+
+	if (amount_in < amount_out)
 		return false;
-	}
-
 	*fee = amount_in - amount_out;
 	return true;
 }
 
-uint64_t bytecoin::get_tx_fee(const Transaction &tx) {
+uint64_t cn::get_tx_fee(const TransactionPrefix &tx) {
 	uint64_t r = 0;
 	if (!get_tx_fee(tx, &r))
 		return 0;
 	return r;
 }
 
-void seria::ser_members(ParentBlockSerializer &v, ISeria &s) {
-	seria_kv("major_version", v.m_parent_block.major_version, s);
-
-	seria_kv("minor_version", v.m_parent_block.minor_version, s);
-	seria_kv("timestamp", v.m_timestamp, s);
-	seria_kv("previous_block_hash", v.m_parent_block.previous_block_hash, s);
-	s.object_key("nonce");
-	s.binary(&v.m_nonce, sizeof(v.m_nonce));  // TODO - fix endianess
-
-	if (v.m_hashing_serialization) {
-		crypto::Hash miner_tx_hash = get_base_transaction_hash(v.m_parent_block.base_transaction);
-		crypto::Hash merkle_root   = crypto::tree_hash_from_branch(v.m_parent_block.base_transaction_branch.data(),
-		    v.m_parent_block.base_transaction_branch.size(), miner_tx_hash, 0);
-
-		seria_kv("merkle_root", merkle_root, s);
+std::vector<size_t> cn::absolute_output_offsets_to_relative(const std::vector<size_t> &off) {
+	invariant(!off.empty(), "Output indexes cannot be empty");
+	std::vector<size_t> relative(off.size());
+	relative[0] = off[0];
+	for (size_t i = 1; i < off.size(); ++i) {
+		invariant(off[i] > off[i - 1], "Output indexes must be unique and sorted");
+		relative[i] = off[i] - off[i - 1];
 	}
+	return relative;
+}
 
-	uint64_t tx_num = static_cast<uint64_t>(v.m_parent_block.transaction_count);
-	seria_kv("transaction_count", tx_num, s);
-	v.m_parent_block.transaction_count = static_cast<uint16_t>(tx_num);
-	if (v.m_parent_block.transaction_count < 1)
-		throw std::runtime_error("Wrong transactions number");
-
-	if (v.m_header_only) {
-		return;
+bool cn::relative_output_offsets_to_absolute(std::vector<size_t> *result, const std::vector<size_t> &off) {
+	if (off.empty())
+		return false;
+	std::vector<size_t> absolute(off.size());
+	absolute[0] = off[0];
+	for (size_t i = 1; i < off.size(); ++i) {
+		if (off[i] == 0 || std::numeric_limits<size_t>::max() - absolute[i - 1] < off[i])
+			return false;
+		absolute[i] = absolute[i - 1] + off[i];
 	}
+	*result = std::move(absolute);
+	return true;
+}
 
-	size_t branch_size = crypto::tree_depth(v.m_parent_block.transaction_count);
-	if (!s.is_input()) {
-		if (v.m_parent_block.base_transaction_branch.size() != branch_size)
-			throw std::runtime_error("Wrong miner transaction branch size");
-	} else {
-		v.m_parent_block.base_transaction_branch.resize(branch_size);
-	}
+BlockBodyProxy cn::get_body_proxy_from_template(
+    const Hash &base_transaction_hash, const std::vector<Hash> &transaction_hashes) {
+	BlockBodyProxy body_proxy;
+	std::vector<Hash> all;
+	all.reserve(transaction_hashes.size() + 1);
+	all.push_back(base_transaction_hash);
+	all.insert(all.end(), transaction_hashes.begin(), transaction_hashes.end());
+	body_proxy.transactions_merkle_root = crypto::tree_hash(all.data(), all.size());
+	body_proxy.transaction_count        = all.size();
+	return body_proxy;
+}
 
-	s.object_key("base_transaction_branch");
-	size_t btb_size = v.m_parent_block.base_transaction_branch.size();
-	s.begin_array(btb_size, true);
-	for (crypto::Hash &hash : v.m_parent_block.base_transaction_branch) {
-		s(hash);
-	}
-	s.end_array();
-
-	seria_kv("miner_tx", v.m_parent_block.base_transaction, s);
-
-	TransactionExtraMergeMiningTag mm_tag;
-	if (!get_merge_mining_tag_from_extra(v.m_parent_block.base_transaction.extra, mm_tag))
-		throw std::runtime_error("Can't get extra merge mining tag");
-	if (mm_tag.depth > 8 * sizeof(crypto::Hash))
-		throw std::runtime_error("Wrong merge mining tag depth");
-
-	if (!s.is_input()) {
-		if (mm_tag.depth != v.m_parent_block.blockchain_branch.size())
-			throw std::runtime_error("Blockchain branch size must be equal to merge mining tag depth");
-	} else {
-		v.m_parent_block.blockchain_branch.resize(mm_tag.depth);
-	}
-
-	s.object_key("blockchain_branch");
-	btb_size = v.m_parent_block.blockchain_branch.size();
-	s.begin_array(btb_size, true);
-	for (crypto::Hash &hash : v.m_parent_block.blockchain_branch) {
-		s(hash);
-	}
-	s.end_array();
+BlockBodyProxy cn::get_body_proxy_from_template(const BlockTemplate &bt) {
+	return cn::get_body_proxy_from_template(get_transaction_hash(bt.base_transaction), bt.transaction_hashes);
 }

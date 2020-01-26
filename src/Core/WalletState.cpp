@@ -6,1349 +6,921 @@
 #include "CryptoNoteTools.hpp"
 #include "TransactionBuilder.hpp"
 #include "TransactionExtra.hpp"
+#include "common/Base58.hpp"
+#include "common/Varint.hpp"
 #include "common/string.hpp"
 #include "crypto/crypto.hpp"
+#include "hardware/Proxy.hpp"
+#include "platform/PathTools.hpp"
+#include "platform/Time.hpp"
 #include "seria/BinaryInputStream.hpp"
 #include "seria/KVBinaryInputStream.hpp"
 #include "seria/KVBinaryOutputStream.hpp"
 
-static const std::string version_current = "2";
+static const std::string ADDRESSES_PREFIX = "a";  // this is not undone
 
-static const std::string TRANSACTION_PREFIX                = "tn/";
-static const std::string HEIGHT_TRANSACTION_PREFIX         = "htn/";
-static const std::string ADDRESS_HEIGHT_TRANSACTION_PREFIX = "ahtn/";
-
-static const std::string TIP_CHAIN_PREFIX       = "ch/";
-static const std::string KEYIMAGE_PREFIX        = "ki/";
-static const std::string HEIGHT_KEYIMAGE_PREFIX = "hki/";
-static const std::string UNSPENT_HEIGHT_PREFIX  = "un/";
-static const std::string HEIGHT_UNSPENT_PREFIX  = "hun/";
-static const std::string HEIGHT_OUTPUT_PREFIX   = "hout/";
-static const std::string BALANCE_PREFIX         = "bal/";
-static const std::string ADDRESS_BALANCE_PREFIX = "abal/";
-
-static const std::string UNLOCK_BLOCK_PREFIX = "unlb/";
-static const std::string UNLOCK_TIME_PREFIX  = "unlt/";
-
-static const std::string ADDRESSES_PREFIX = "ad/";
-
-using namespace bytecoin;
+using namespace cn;
 using namespace platform;
 
-WalletPreparatorMulticore::WalletPreparatorMulticore() {
-	auto th_count =
-	    std::max<size_t>(2, 3 * std::thread::hardware_concurrency() / 4);  // we use more energy but have the
-	                                                                       // same speed when using
-	                                                                       // hyperthreading to max
-	std::cout << "Starting multicore transaction preparator using " << th_count << "/"
-	          << std::thread::hardware_concurrency() << " cpus" << std::endl;
-	for (size_t i = 0; i != th_count; ++i)
-		threads.emplace_back(&WalletPreparatorMulticore::thread_run, this);
-}
-
-WalletPreparatorMulticore::~WalletPreparatorMulticore() {
-	{
-		std::unique_lock<std::mutex> lock(mu);
-		quit = true;
-		have_work.notify_all();
-	}
-	for (auto &&th : threads)
-		th.join();
-}
-
-PreparedWalletTransaction::PreparedWalletTransaction(TransactionPrefix &&ttx, const SecretKey &view_secret_key)
-    : tx(std::move(ttx)) {
-	PublicKey tx_public_key = get_transaction_public_key_from_extra(tx.extra);
-	if (!generate_key_derivation(tx_public_key, view_secret_key, derivation))
-		return;
-	KeyPair tx_keys;
-	size_t key_index   = 0;
-	uint32_t out_index = 0;
-	spend_keys.reserve(tx.outputs.size());
-	for (const auto &output : tx.outputs) {
-		if (output.target.type() == typeid(KeyOutput)) {
-			const KeyOutput &key_output = boost::get<KeyOutput>(output.target);
-			PublicKey spend_key;
-			underive_public_key(derivation, key_index, key_output.key,
-			    spend_key);  // error indicated by spend_key == PublicKey{}
-			spend_keys.push_back(spend_key);
-			++key_index;
-		}
-		++out_index;
-	}
-}
-PreparedWalletBlock::PreparedWalletBlock(BlockTemplate &&bc_header, std::vector<TransactionPrefix> &&raw_transactions,
-    Hash base_transaction_hash, const SecretKey &view_secret_key)
-    : base_transaction_hash(base_transaction_hash) {
-	header           = bc_header;
-	base_transaction = PreparedWalletTransaction(std::move(bc_header.base_transaction), view_secret_key);
-	transactions.reserve(raw_transactions.size());
-	for (size_t tx_index = 0; tx_index != raw_transactions.size(); ++tx_index) {
-		transactions.emplace_back(std::move(raw_transactions.at(tx_index)), view_secret_key);
-	}
-}
-
-void WalletPreparatorMulticore::thread_run() {
-	while (true) {
-		SecretKey view_secret_key;
-		Height height          = 0;
-		int local_work_counter = 0;
-		api::bytecoind::SyncBlocks::SyncBlock sync_block;
-		std::vector<std::vector<uint32_t>> global_indices;
-		{
-			std::unique_lock<std::mutex> lock(mu);
-			if (quit)
-				return;
-			if (work.blocks.empty()) {
-				have_work.wait(lock);
-				continue;
-			}
-			local_work_counter = work_counter;
-			view_secret_key    = work_secret_key;
-			height             = work.start_height;
-			sync_block         = std::move(work.blocks.front());
-			work.start_height += 1;
-			work.blocks.erase(work.blocks.begin());
-		}
-		PreparedWalletBlock result(std::move(sync_block.raw_header), std::move(sync_block.raw_transactions),
-		    sync_block.base_transaction_hash, view_secret_key);
-		{
-			std::unique_lock<std::mutex> lock(mu);
-			if (local_work_counter == work_counter) {
-				prepared_blocks[height] = std::move(result);
-				result_ready.notify_all();
-			}
-		}
-	}
-}
-
-void WalletPreparatorMulticore::cancel_work() {
-	std::unique_lock<std::mutex> lock(mu);
-	work = api::bytecoind::SyncBlocks::Response();
-	prepared_blocks.clear();
-	work_counter += 1;
-}
-
-void WalletPreparatorMulticore::start_work(const api::bytecoind::SyncBlocks::Response &new_work,
-    const SecretKey &view_secret_key) {
-	std::unique_lock<std::mutex> lock(mu);
-	work            = new_work;
-	work_secret_key = view_secret_key;
-	work_counter += 1;
-	have_work.notify_all();
-}
-
-PreparedWalletBlock WalletPreparatorMulticore::get_ready_work(Height height) {
-	while (true) {
-		std::unique_lock<std::mutex> lock(mu);
-		auto pit = prepared_blocks.find(height);
-		if (pit == prepared_blocks.end()) {
-			result_ready.wait(lock);
-			continue;
-		}
-		PreparedWalletBlock result = std::move(pit->second);
-		pit                        = prepared_blocks.erase(pit);
-		return result;
-	}
-}
-
-template<class T>
-std::string to_binary_key(const T &s) {
-	static_assert(std::is_standard_layout<T>::value, "T must be Standard Layout");
-	return common::to_hex(&s, sizeof(s));  // WalletState::DB::to_binary_key((const unsigned char *)&s, sizeof(s));
-}
-
-template<class T>
-void from_binary_key(const std::string &key, T &s) {
-	static_assert(std::is_standard_layout<T>::value, "T must be Standard Layout");
-	if (!common::pod_from_hex(key, s))  // WalletState::DB::to_binary_key((const unsigned char *)&s, sizeof(s));
-		throw std::logic_error("from_binary_key failed for key " + key);
-}
-
-void WalletState::DeltaState::redo_transaction(
-    Height, const Hash &tid, const TransactionPrefix &tx, const api::Transaction &ptx) {
-	if (!m_transactions.insert(std::make_pair(tid, std::make_pair(tx, ptx))).second)
-		throw std::logic_error("DeltaState::redo_transaction already exists. Invariant dead");
-}
-
-void WalletState::DeltaState::undo_transaction(Height, const Hash &tid) {
-	if (m_transactions.erase(tid) != 1)
-		throw std::logic_error("DeltaState::undo_transaction does not exist. Invariant dead");
-}
-
-void WalletState::DeltaState::redo_keyimage_output(
-    const api::Output &output, Height block_height, Timestamp block_unlock_timestamp) {
+bool WalletState::DeltaState::add_incoming_output(const api::Output &output) {
 	m_unspents[output.public_key].push_back(output);
+	return true;
 }
 
-void WalletState::DeltaState::undo_keyimage_output(const api::Output &output) {
-	throw std::logic_error("DeltaState::undo_keyimage_output");
-	// We do not call it on memory states
+Amount WalletState::DeltaState::add_incoming_keyimage(Height height, const KeyImage &key_image) {
+	auto tit = m_transactions.find(m_last_added_transaction);
+	if (tit == m_transactions.end())
+		return 0;
+	if (tit->second.used_keyimages.insert(key_image).second)
+		m_used_keyimages[key_image].push_back(tit->first);
+	return 0;  // It does not know
 }
 
-void WalletState::DeltaState::redo_height_keyimage(Height height, const KeyImage &keyimage) {
-	m_used_keyimages[keyimage] += 1;
-}
-
-void WalletState::DeltaState::undo_height_keyimage(Height height, const KeyImage &keyimage) {
-	auto kit = m_used_keyimages.find(keyimage);
-	if (kit == m_used_keyimages.end()) {
-		std::cout << "DeltaState::undo_height_keyimage more keyimages undone than redone" << std::endl;
-		return;
-	}
-	kit->second -= 1;
-	if (kit->second < 0)
-		std::cout << "DeltaState::undo_height_keyimage more keyimages undone than redone 2"
-		          << std::endl;
-	if (kit->second <= 0)
-		kit = m_used_keyimages.erase(kit);
-}
-
-void WalletState::DeltaState::apply(IWalletState *parent_state) const {
-	for (auto &&pa : m_unspents)
-		for (auto &&out : pa.second)
-			parent_state->redo_keyimage_output(out, m_block_height, m_unlock_timestamp);
-	for (auto &&ki : m_used_keyimages)
-		parent_state->redo_height_keyimage(m_block_height, ki.first);
-	for (auto &&tx : m_transactions)
-		parent_state->redo_transaction(m_block_height, tx.first, tx.second.first, tx.second.second);
+void WalletState::DeltaState::add_transaction(
+    Height, const Hash &tid, const PreparedWalletTransaction &pwtx, const api::Transaction &ptx) {
+	// We replace transactions in mempool routinely
+	// 1. when they are added from PQ, then come from bytecoind
+	// 2. when we push block with keyimage used by some transaction (can happen during sync with lagged daemon)
+	undo_transaction(tid);
+	invariant(m_transactions.insert(std::make_pair(tid, DeltaStateTransaction{pwtx, ptx, std::set<KeyImage>{}})).second,
+	    "transaction already exists. Invariant dead");
+	m_last_added_transaction = tid;
 }
 
 void WalletState::DeltaState::undo_transaction(const Hash &tid) {
 	auto tit = m_transactions.find(tid);
 	if (tit == m_transactions.end())
 		return;
-	const TransactionPrefix &tx = tit->second.first;
+	const TransactionPrefix &tx = tit->second.pwtx.tx;
 	for (const auto &output : tx.outputs) {
-		if (output.target.type() == typeid(KeyOutput)) {
-			const KeyOutput &key_output = boost::get<KeyOutput>(output.target);
-			auto uit                    = m_unspents.find(key_output.key);
-			if (uit == m_unspents.end() || uit->second.empty())  // Actually should never be empty
-				continue;                                        // Not our output
-			uit->second.pop_back();
-			// We can pop wrong output, but this is not important - situation arises only in pool and only during attack
+		if (const auto *out = boost::get<OutputKey>(&output)) {
+			auto uit = m_unspents.find(out->public_key);
+			if (uit == m_unspents.end())  // Actually should never be empty
+				continue;                 // Not our output
+			for (auto oit = uit->second.begin(); oit != uit->second.end(); ++oit)
+				if (oit->amount == out->amount) {
+					// We need to pop right output, or balance will be trashed
+					oit = uit->second.erase(oit);
+					break;
+				}
 			if (uit->second.empty())
 				uit = m_unspents.erase(uit);
 		}
 	}
-	for (const auto &input : tx.inputs) {
-		if (input.type() == typeid(CoinbaseInput)) {
-		} else if (input.type() == typeid(KeyInput)) {
-			const KeyInput &in = boost::get<KeyInput>(input);
-			undo_height_keyimage(m_block_height, in.key_image);
+	for (const auto &ki_or_pk : tit->second.used_keyimages) {
+		auto kit = m_used_keyimages.find(ki_or_pk);
+		invariant(kit != m_used_keyimages.end(), "");
+		bool erased = false;
+		for (size_t i = 0; i != kit->second.size(); ++i) {
+			if (kit->second[i] == tit->first) {
+				kit->second.erase(kit->second.begin() + i);
+				erased = true;
+				break;
+			}
 		}
+		invariant(erased, "");
+		if (kit->second.empty())
+			kit = m_used_keyimages.erase(kit);
 	}
 	tit = m_transactions.erase(tit);
 }
 
-void WalletState::DeltaState::clear(Height new_block_height) {
-	m_block_height = new_block_height;
+void WalletState::DeltaState::apply(IWalletState *parent_state, Height height) const {
+	for (const auto &tx : m_transactions)
+		parent_state->add_transaction(height, tx.first, tx.second.pwtx, tx.second.atx);
+	for (const auto &pk : m_unspents)
+		for (const auto &output : pk.second)
+			parent_state->add_incoming_output(output);
+	for (const auto &ki : m_used_keyimages) {
+		invariant(!ki.second.empty(), "DeltaState keyimages index corrupted");
+		parent_state->add_incoming_keyimage(height, ki.first);
+	}
+	// TODO test before 3.5
+}
+
+void WalletState::DeltaState::clear() {
 	m_used_keyimages.clear();
 	m_unspents.clear();
 	m_transactions.clear();
 }
 
-void WalletState::DeltaState::set_height(Height new_block_height) { m_block_height = new_block_height; }
-
-bool WalletState::DeltaState::is_spent(const api::Output &output) const {
-	return m_used_keyimages.count(output.key_image) != 0;
+void WalletState::DeltaState::add_keyimage_from_block(const KeyImage &ki) {
+	auto kit = m_used_keyimages.find(ki);
+	if (kit != m_used_keyimages.end())
+		transactions_to_reaply.insert(kit->second.begin(), kit->second.end());
 }
 
-WalletState::WalletState(Wallet &wallet, logging::ILogger &log, const Config &config, const Currency &currency)
-    : m_genesis_bid(currency.genesis_block_hash)
-    , m_config(config)
-    , m_currency(currency)
-    , m_log(log)
-    , m_wallet(wallet)
-    , m_db(false, config.get_data_folder("wallet_cache") + "/" + wallet.get_cache_name(),
-          0x2000000000)  // 128 gb
-    , log_redo_block(std::chrono::steady_clock::now())
-    , m_memory_state(0, 0) {
-	std::string version;
-	m_db.get("$version", version);
-	if (version != version_current) {
-		std::cout << "Data format changed, old version=" << version << " current version=" << version_current
-		          << ", deleting wallet cache..." << std::endl;
-		for (DB::Cursor cur = m_db.rbegin(std::string()); !cur.end(); cur.erase()) {
+WalletState::WalletState(Wallet &wallet, logging::ILogger &log, const Config &config, const Currency &currency, DB &db)
+    : WalletStateBasic(log, config, currency, db, wallet.get_cache_name())
+    , m_log_redo_block(std::chrono::steady_clock::now())
+    , m_wallet(wallet) {
+	if (m_wallet.is_amethyst()) {
+		for (DB::Cursor cur = m_db.rbegin(ADDRESSES_PREFIX); !cur.end();)
+			cur.erase();
+		BinaryArray ts, ac;
+		// TODO - convert to invariant after DB upgrade
+		if (m_db.get("$oldest_timestamp", ts) && m_db.get("$address_count", ac)) {
+			Timestamp oldest_timestamp = 0;
+			size_t cache_address_count = 0;
+			seria::from_binary(oldest_timestamp, ts);
+			seria::from_binary(cache_address_count, ac);
+			if (m_wallet.get_oldest_timestamp() < oldest_timestamp)
+				clear_db(true);
+			if (m_wallet.get_actual_records_count() < cache_address_count)
+				m_wallet.create_look_ahead_records(cache_address_count);
 		}
-		m_db.put("$version", version_current, true);
-	}
-	if (!read_tips()) {
-		BinaryArray ba = seria::to_binary(m_genesis_bid);
-		m_db.put("$genesis_bid", ba, true);
-		push_chain(BlockChainState::fill_genesis(m_genesis_bid, currency.genesis_block_template));
 	}
 	wallet_addresses_updated();
+	auto pq = m_wallet.payment_queue_get();
+	for (const auto &body : pq) {
+		Transaction tx;
+		try {
+			add_to_payment_queue(body, false);
+		} catch (const std::exception &) {
+			m_log(logging::WARNING) << "Error adding transaction to payment queue ";
+			continue;
+		}
+	}
 }
 
 void WalletState::db_commit() {
-	std::cout << "WalletState::db_commit started... tip_height=" << m_tip_height << std::endl;
-	m_db.commit_db_txn();
-	std::cout << "WalletState::db_commit finished..." << std::endl;
+	if (m_wallet.is_amethyst()) {
+		m_db.put("$address_count", seria::to_binary(m_wallet.get_actual_records_count()), false);
+		m_db.put("$oldest_timestamp", seria::to_binary(m_wallet.get_oldest_timestamp()), false);
+	}
+	WalletStateBasic::db_commit();
 }
 
 void WalletState::wallet_addresses_updated() {
+	if (m_wallet.is_amethyst())
+		return;
 	Timestamp undo_timestamp = std::numeric_limits<Timestamp>::max();
-	for (auto rec : m_wallet.get_records()) {
-		const WalletRecord &wa = rec.second;
-		auto keyuns            = ADDRESSES_PREFIX + to_binary_key(wa.spend_public_key);
-		std::string st;
-		if (!m_db.get(keyuns, st) || wa.creation_timestamp < boost::lexical_cast<Timestamp>(st)) {
-			undo_timestamp = std::min(undo_timestamp, wa.creation_timestamp);
-			m_db.put(keyuns, common::to_string(wa.creation_timestamp), false);
+	try {
+		for (size_t i = 0; i != m_wallet.get_actual_records_count(); ++i) {
+			WalletRecord wa;
+			m_wallet.get_record(i, &wa, nullptr);
+			auto keyuns =
+			    ADDRESSES_PREFIX + DB::to_binary_key(wa.spend_public_key.data, sizeof(wa.spend_public_key.data));
+			std::string st;
+			if (!m_db.get(keyuns, st) || wa.creation_timestamp < common::integer_cast<Timestamp>(st)) {
+				undo_timestamp = std::min(undo_timestamp, wa.creation_timestamp);
+				m_db.put(keyuns, common::to_string(wa.creation_timestamp), false);
+			}
 		}
+		// We never delete from ADDRESSES_PREFIX index, because it correctly reflects
+		// scanned outputs, their spendable and balances
+		if (undo_timestamp == std::numeric_limits<Timestamp>::max()) {
+			return;  // db.commit() not worth here, will just update addresses again in case of ctrl-c
+		}
+		while (get_tip().timestamp + m_currency.block_future_time_limit >= undo_timestamp &&
+		       pop_chain()) {  // Undo excess blocks in case timestamps are out of order
+		}
+	} catch (const std::exception &ex) {
+		m_log(logging::ERROR)
+		    << "Exception in wallet_addresses_updated, probably out of disk space or database corrupted error="
+		    << common::what(ex) << " path=" << m_db.get_path();
+		std::exit(api::BYTECOIND_DATABASE_ERROR);
 	}
-	// We never delete from ADDRESSES_PREFIX index, because it correctly reflects
-	// scanned outputs, their spendable and
-	// balances
-	if (undo_timestamp == std::numeric_limits<Timestamp>::max()) {
-		return;  // db.commit() not worth here, will just update addresses again in
-		         // case of ctrl-c
-	}
-	while (m_tip_height + 1 > m_tail_height &&
-	       get_tip().timestamp + m_currency.block_future_time_limit >=
-	           undo_timestamp) {  // Undo excess blocks in case timestamps are out of
-		                          // order
-		undo_block(m_tip_height);
-		pop_chain();
-	}
+	fix_payment_queue_after_undo_redo();
 	db_commit();
 }
 
-std::vector<WalletRecord> WalletState::generate_new_addresses(const std::vector<SecretKey> &sks, Timestamp ct) {
-	auto result = m_wallet.generate_new_addresses(sks, ct);
-	if (result.size() != sks.size())  // most likely result is empty, because view-only
-		return result;
-	Timestamp undo_timestamp = std::numeric_limits<Timestamp>::max();
-	for (size_t i = 0; i != std::min(result.size(), sks.size()); ++i) {
-		const WalletRecord &wa = result.at(i);
-		auto keyuns            = ADDRESSES_PREFIX + to_binary_key(wa.spend_public_key);
-		std::string st;
-		if (!m_db.get(keyuns, st) || wa.creation_timestamp < boost::lexical_cast<Timestamp>(st)) {
-			if (sks.at(i) != SecretKey{})  // Newly generated addresses never lead to undo
-				undo_timestamp = std::min(undo_timestamp, wa.creation_timestamp);
-			m_db.put(keyuns, common::to_string(wa.creation_timestamp), false);
-		}
-	}
-	if (undo_timestamp == std::numeric_limits<Timestamp>::max()) {
-		db_commit();
-		return result;
-	}
-	while (m_tip_height + 1 > m_tail_height &&
-	       get_tip().timestamp + m_currency.block_future_time_limit >=
-	           undo_timestamp) {  // Undo excess blocks in case timestamps are out of
-		                          // order
-		undo_block(m_tip_height);
-		pop_chain();
-	}
-	db_commit();
+std::vector<WalletRecord> WalletState::generate_new_addresses(
+    const std::vector<SecretKey> &sks, Timestamp ct, Timestamp now, std::vector<AccountAddress> *addresses) {
+	bool rescan_from_ct = false;
+	auto result         = m_wallet.generate_new_addresses(sks, ct, now, addresses, &rescan_from_ct);
+	if (rescan_from_ct)
+		wallet_addresses_updated();
 	return result;
 }
 
-bool WalletState::sync_with_blockchain(api::bytecoind::SyncBlocks::Response &resp) {
-	if (resp.blocks.empty())  // Our creation timestamp > last block timestamp, so
-		                      // no blocks
+void WalletState::create_addresses(size_t count) {
+	if (count <= m_wallet.get_actual_records_count())
+		return;
+	m_wallet.create_look_ahead_records(count);
+	wallet_addresses_updated();
+}
+
+bool WalletState::add_to_payment_queue(const BinaryArray &binary_transaction, bool save_file) {
+	Transaction tx;
+	seria::from_binary(tx, binary_transaction);
+	Hash tid = get_transaction_hash(tx);
+	PreparedWalletTransaction pwtx(
+	    tid, binary_transaction.size(), Transaction(tx), m_wallet.get_output_handler(), m_wallet.get_view_secret_key());
+	// Will throw here if HW disconnected, this is ok in both save_file cases
+
+	auto &by_hash_index = payment_queue.get<by_hash>();
+	auto git            = by_hash_index.find(tid);
+	if (git != by_hash_index.end())
+		return true;  // alredy here, nop
+	if (save_file)
+		m_wallet.payment_queue_add(tid, binary_transaction);
+	api::Transaction ptx;
+	QueueEntry entry{tid, binary_transaction, pwtx, 0, 0};
+	//    std::cout << "by_hash_index.size=" << by_hash_index.size() << std::endl;
+	m_tx_pool_version += 1;
+	if (api_get_transaction(tid, false, nullptr, &ptx)) {
+		entry.remove_height = ptx.block_height + m_config.payment_queue_confirmations;
+		entry.fee_per_kb    = ptx.fee / binary_transaction.size();
+		payment_queue.insert(entry);
+		m_log(logging::INFO) << "Now PQ transaction " << tid << " is in BC, remove_height=" << entry.remove_height
+		                     << " payment_queue.size=" << payment_queue.size();
 		return true;
-	while (m_tip_height > resp.start_height + resp.blocks.size() - 1 &&
-	       m_tip_height + 1 > m_tail_height) {  // first undo excess blocks at head
-		undo_block(m_tip_height);
-		pop_chain();
-		m_tx_pool_version = 1;
 	}
-	while (m_tip_height >= resp.start_height &&
-	       m_tip_height + 1 > m_tail_height) {  // then undo all blocks at head with different bids
-		const api::BlockHeader &other_header = resp.blocks[m_tip_height - resp.start_height].header;
-		if (m_tip.hash == other_header.hash)
-			break;
-		if (m_tip_height == 0)
-			return false;  // Different genesis bid
-		undo_block(m_tip_height);
-		pop_chain();
-		m_tx_pool_version = 1;
+	entry.fee_per_kb = get_tx_fee(tx) / binary_transaction.size();
+	payment_queue.insert(entry);
+	add_transaction_to_mempool(tid, pwtx, true);
+	return true;
+}
+
+BinaryArray WalletState::get_next_from_sending_queue(Hash *previous_hash) {
+	auto &by_hash_index = payment_queue.get<by_hash>();
+	//	std::cout << "by_hash_index.size=" << by_hash_index.size() << std::endl;
+	//	for(auto && bhit : by_hash_index)
+	//		std::cout << "    " << bhit.hash << std::endl;
+	auto git = by_hash_index.lower_bound(*previous_hash);
+	if (git == by_hash_index.end())
+		return BinaryArray{};
+	if (git->hash == *previous_hash)  // Otherwise previous tx was removed
+		++git;
+	while (git != by_hash_index.end() && git->in_blockchain())
+		++git;
+	if (git == by_hash_index.end())
+		return BinaryArray{};
+	*previous_hash = git->hash;
+	return git->binary_transaction;
+}
+
+void WalletState::process_payment_queue_send_error(Hash hash, const api::cnd::SendTransaction::Error &error) {
+	if (error.code == api::cnd::SendTransaction::INVALID_TRANSACTION_BINARY_FORMAT ||
+	    ((error.code == api::cnd::SendTransaction::OUTPUT_ALREADY_SPENT ||
+	         error.code == api::cnd::SendTransaction::WRONG_OUTPUT_REFERENCE) &&
+	        get_tip_height() > error.conflict_height + m_config.payment_queue_confirmations)) {
+		m_log(logging::INFO) << "Removing transaction from PQ because send error " << error.what();
+		auto &by_hash_index = payment_queue.get<by_hash>();
+		auto git            = by_hash_index.find(hash);
+		if (git != by_hash_index.end())
+			by_hash_index.erase(git);
+		remove_transaction_from_mempool(hash, true);
+		m_wallet.payment_queue_remove(hash);
+		m_tx_pool_version += 1;
 	}
-	if (m_tip_height + 1 < resp.start_height)
-		while (m_tip_height + 1 > m_tail_height) {  // undo everything
-			undo_block(m_tip_height);
-			pop_chain();
-			m_tx_pool_version = 1;
+}
+
+const WalletState::QueueEntry *WalletState::find_in_payment_queue(const Hash &hash) {
+	auto &by_hash_index = payment_queue.get<by_hash>();
+	auto git            = by_hash_index.find(hash);
+	if (git == by_hash_index.end())
+		return nullptr;
+	return &*git;
+}
+
+void WalletState::fix_payment_queue_after_undo_redo() {
+	auto &by_hash_index = payment_queue.get<by_hash>();
+	//    std::cout << "by_hash_index.size=" << by_hash_index.size() << std::endl;
+	std::vector<Hash> added_to_bc;
+	std::vector<Hash> removed_from_bc;
+	bool pq_modified = false;
+	for (auto git = by_hash_index.begin(); git != by_hash_index.end(); ++git) {
+		if (git->in_blockchain() && !api_has_transaction(git->hash, false))
+			removed_from_bc.push_back(git->hash);
+		if (!git->in_blockchain() && api_has_transaction(git->hash, false))
+			added_to_bc.push_back(git->hash);
+	}
+	for (auto tid : removed_from_bc) {
+		auto git = by_hash_index.find(tid);
+		if (git == by_hash_index.end())
+			continue;
+		QueueEntry entry = *git;
+		by_hash_index.erase(git);
+		entry.remove_height = 0;
+		payment_queue.insert(entry);
+		pq_modified = true;
+		add_transaction_to_mempool(tid, entry.pwtx, true);
+	}
+	for (auto tid : added_to_bc) {
+		auto git = by_hash_index.find(tid);
+		if (git == by_hash_index.end())
+			continue;
+		api::Transaction ptx;
+		if (!api_get_transaction(tid, false, nullptr, &ptx))
+			continue;
+		QueueEntry entry = *git;
+		by_hash_index.erase(git);
+		entry.remove_height = ptx.block_height + m_config.payment_queue_confirmations;
+		payment_queue.insert(entry);
+		pq_modified = true;
+		remove_transaction_from_mempool(tid, true);
+	}
+	auto &by_remove_height_index = payment_queue.get<by_remove_height>();
+	//    std::cout << "by_remove_height_index.size=" << by_remove_height_index.size() << std::endl;
+	auto git = by_remove_height_index.lower_bound(1);
+	while (git != by_remove_height_index.end() && get_tip_height() >= git->remove_height) {
+		m_wallet.payment_queue_remove(git->hash);
+		git         = by_remove_height_index.erase(git);
+		pq_modified = true;
+	}
+	if (pq_modified)
+		m_tx_pool_version += 1;
+}
+
+void WalletState::add_transaction_to_mempool(Hash tid, const PreparedWalletTransaction &pwtx, bool from_pq) {
+	const auto now = platform::now_unix_timestamp();
+	m_log(logging::INFO) << "Now " << (from_pq ? "PQ" : "node") << " transaction " << tid
+	                     << " is in MS size before adding=" << m_memory_state.get_transactions().size();
+	std::vector<size_t> stack_indexes(pwtx.tx.outputs.size(), 0);
+	// redo_transaction will replace transaction in mempool
+	redo_transaction(pwtx, stack_indexes, 0, &m_memory_state, false, tid, get_tip_height() + 1, Hash{}, now);
+	m_tx_pool_version += 1;
+}
+
+void WalletState::remove_transaction_from_mempool(Hash tid, bool from_pq) {
+	if (m_pool_hashes.count(tid) != 0)
+		return;
+	const QueueEntry *entry = find_in_payment_queue(tid);
+	if (entry && !entry->in_blockchain())
+		return;
+	m_log(logging::INFO) << "Removing " << (from_pq ? "PQ" : "node") << " transaction " << tid << " from MS";
+	m_memory_state.undo_transaction(tid);
+}
+
+bool WalletState::sync_with_blockchain(const std::vector<Hash> &removed_hashes) {
+	for (const auto &tid : removed_hashes) {
+		if (m_pool_hashes.erase(tid) != 0)
+			remove_transaction_from_mempool(tid, false);
+	}
+	return true;
+}
+
+bool WalletState::sync_with_blockchain_finished() {
+	while (!m_memory_state.transactions_to_reaply.empty()) {
+		Hash tid = *m_memory_state.transactions_to_reaply.begin();
+		auto tit = m_memory_state.get_transactions().find(tid);
+		if (tit == m_memory_state.get_transactions().end()) {
+			m_memory_state.transactions_to_reaply.erase(tid);
+			continue;
 		}
-	if (m_tip_height + 1 == m_tail_height) {
-		m_tail_height = resp.start_height;
-		m_tip_height  = m_tail_height - 1;
-	}
-	preparator.cancel_work();
-	preparator.start_work(resp, m_wallet.get_view_secret_key());
-	while (m_tip_height + 1 < resp.start_height + resp.blocks.size()) {
-		size_t bin                     = m_tip_height + 1 - resp.start_height;
-		const api::BlockHeader &header = resp.blocks.at(bin).header;
-		if (m_tip_height + 1 != m_tail_height && header.previous_block_hash != m_tip.hash)
+		auto pwtx = tit->second.pwtx;  // Copy, source will be replaced in next line
+		if (!sync_with_blockchain(pwtx))
 			return false;
-		if (header.timestamp + m_currency.block_future_time_limit >= m_wallet.get_oldest_timestamp()) {
-			const auto &block_gi   = resp.blocks.at(bin).global_indices;
-			PreparedWalletBlock pb = preparator.get_ready_work(m_tip_height + 1);
-			// PreparedWalletBlock pb(std::move(resp.blocks.at(bin).block), m_wallet.get_view_secret_key());
-			redo_block(header, pb, block_gi, m_tip_height + 1);
-			//			push_chain(header);
-			//			undo_block(m_tip_height);
-			//			pop_chain();
-			//			redo_block(header, pb, block_gi, m_tip_height + 1);
-			auto now = std::chrono::steady_clock::now();
-			if (std::chrono::duration_cast<std::chrono::milliseconds>(now - log_redo_block).count() > 1000) {
-				log_redo_block = now;
-				std::cout << "WalletState redo block, height=" << m_tip_height << "/"
-				          << resp.status.top_known_block_height << std::endl;
-			}
+		m_memory_state.transactions_to_reaply.erase(tid);
+	}
+	return true;
+}
+
+bool WalletState::sync_with_blockchain(const PreparedWalletBlock &pb, Height top_known_block_height) {
+	if (db_empty() && pb.raw_block.header.height != 0 &&
+	    pb.raw_block.header.timestamp > m_wallet.get_oldest_timestamp()) {
+		// pb.raw_block.header.height != 0 for case when genesis does not start with timestamp 0
+		m_log(logging::INFO) << "WalletState redo skipping block after undo beyond history bid="
+		                     << pb.raw_block.header.hash << " oldest_timestamp=" << m_wallet.get_oldest_timestamp();
+		return true;
+	}
+	try {
+		while (get_tip_bid() != pb.raw_block.header.previous_block_hash && pop_chain()) {
 		}
-		push_chain(header);
-		m_tx_pool_version = 1;
+		const auto &block_si = pb.raw_block.output_stack_indexes;
+		redo_block(pb, block_si, pb.raw_block.header.height);
+		//			push_chain(header);
+		//			pop_chain();
+		//			redo_block(header, pb, block_si, pb.raw_block.header.height);
+		auto now = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::milliseconds>(now - m_log_redo_block).count() > 1000 ||
+		    pb.raw_block.header.height == top_known_block_height) {
+			m_log_redo_block = now;
+			m_log(logging::INFO) << "WalletState redo block, height=" << pb.raw_block.header.height << "/"
+			                     << top_known_block_height;
+		}
+		push_chain(pb.raw_block.header);
+	} catch (const hardware::HardwareWallet::Exception &ex) {
+		m_log(logging::INFO) << "Hardware wallet disconnected, will try reconnection after some delay, err="
+		                     << common::what(ex);
+		return false;
+	} catch (const std::exception &ex) {
+		m_log(logging::ERROR)
+		    << "Exception in sync_with_blockchain, probably out of disk space or database corrupted error="
+		    << common::what(ex) << " path=" << m_db.get_path();
+		std::exit(api::BYTECOIND_DATABASE_ERROR);
 	}
 	return true;
 }
 
 std::vector<Hash> WalletState::get_tx_pool_hashes() const {
 	return std::vector<Hash>(m_pool_hashes.begin(), m_pool_hashes.end());
+	//	std::vector<Hash> result;
+	//	result.reserve(m_memory_state.get_transactions().size());
+	//	for(const auto & tx : m_memory_state.get_transactions())
+	//		result.push_back(tx.first);
+	//	return result;
 }
 
-bool WalletState::sync_with_blockchain(api::bytecoind::SyncMemPool::Response &resp) {
-	for (auto tid : resp.removed_hashes) {
-		if (m_pool_hashes.erase(tid) != 0) {
-		}
-		m_memory_state.undo_transaction(tid);
+bool WalletState::sync_with_blockchain(const PreparedWalletTransaction &pwtx) {
+	try {
+		add_transaction_to_mempool(pwtx.tid, pwtx, false);
+		m_pool_hashes.insert(pwtx.tid);
+	} catch (const hardware::HardwareWallet::Exception &ex) {
+		m_log(logging::INFO) << "Hardware wallet disconnected, will try reconnection after some delay, err="
+		                     << common::what(ex);
+		return false;
+	} catch (const std::exception &ex) {
+		m_log(logging::ERROR) << "Exception in sync_with_blockchain, mempool probably corrupted error="
+		                      << common::what(ex) << " path=" << m_db.get_path();
+		return false;
 	}
-	for (size_t i = 0; i != resp.added_raw_transactions.size(); ++i) {
-		TransactionPrefix &tx = resp.added_raw_transactions[i];
-		//		seria::from_binary(tx, resp.added_binary_transactions[i]);
-		std::vector<uint32_t> global_indices(tx.outputs.size(), 0);
-		Hash tid = resp.added_transactions.at(i).hash;  // get_transaction_hash(tx);
-		if (!m_pool_hashes.insert(tid).second) {        // Already there
-			continue;
-		}
-		PreparedWalletTransaction pwtx(std::move(tx), m_wallet.get_view_secret_key());
-		if (!redo_transaction(
-		        pwtx, global_indices, &m_memory_state, false, tid, Hash{}, resp.added_transactions.at(i).timestamp)) {
-		}
-	}
-	m_tx_pool_version = resp.status.transaction_pool_version;
 	return true;
 }
 
-void WalletState::add_transient_transaction(const Hash &tid, const TransactionPrefix &tx) {
-	if (!m_pool_hashes.insert(tid).second) {  // Already there
-		return;
-	}
-	std::vector<uint32_t> global_indices(tx.outputs.size(), 0);
-	PreparedWalletTransaction pwtx(TransactionPrefix(tx), m_wallet.get_view_secret_key());
-	if (!redo_transaction(pwtx, global_indices, &m_memory_state, false, tid, Hash{}, m_tip.timestamp)) {
-	}  // just ignore result
-}
-
-std::vector<Hash> WalletState::get_sparse_chain() const {
-	std::vector<Hash> tip_path;
-
-	uint32_t jump = 0;
-	if (m_tip_height + 1 > m_tail_height)
-		while (m_tip_height >= jump + m_tail_height) {
-			tip_path.push_back(read_chain(m_tip_height - jump).hash);
-			if (tip_path.size() <= 10)
-				jump += 1;
-			else
-				jump += (1 << (tip_path.size() - 10));
-		}
-	if (tip_path.empty() || tip_path.back() != m_genesis_bid)
-		tip_path.push_back(m_genesis_bid);
-	return tip_path;
-}
-
-void WalletState::test_undo_blocks() {
-	int counter = 0;
-	//	for (DB::Cursor cur = m_db.begin(std::string()); !cur.end(); cur.next()) {
-	//		if (cur.get_suffix().find(ADDRESSES_PREFIX) == 0)
-	//			continue;
-	//		std::cout << DB::clean_key(cur.get_suffix()) << std::endl;
-	//		if (counter++ > 2000)
-	//			break;
-	//	}
-	while (m_tip_height + 1 > m_tail_height) {
-		undo_block(m_tip_height);
-		pop_chain();
-	}
-	std::cout << "---- After undo everything ---- " << std::endl;
-	counter = 0;
-	for (DB::Cursor cur = m_db.begin(std::string()); !cur.end(); cur.next()) {
-		if (cur.get_suffix().find(ADDRESSES_PREFIX) == 0)
-			continue;
-		std::cout << DB::clean_key(cur.get_suffix()) << std::endl;
-		if (counter++ > 2000)
-			break;
-	}
-}
-
-void WalletState::test_print_everything(const std::string &str) {
-	std::cout << str << " tail:tip_height=" << m_tail_height << ":" << get_tip_height() << std::endl;
-	for (DB::Cursor cur = m_db.begin(std::string()); !cur.end(); cur.next()) {
-		if (cur.get_suffix().find(TIP_CHAIN_PREFIX) == 0)
-			continue;
-		if (cur.get_suffix().find(ADDRESSES_PREFIX) == 0)
-			continue;
-		std::cout << DB::clean_key(cur.get_suffix()) << std::endl;
-	}
-}
-
-bool WalletState::redo_block(const api::BlockHeader &header, const PreparedWalletBlock &pb,
-    const BlockChainState::BlockGlobalIndices &global_indices, Height height) {
-	if (height != m_tip_height + 1)
-		throw std::runtime_error("Redo of incorrect block");
-	if (global_indices.size() != pb.transactions.size() + 1)
-		return false;  // Bad node
-	// order is important here. Unlock before redo, or will lock/unlock twice ->
-	// invariant dead
-	// If we are redoing first block, there is nothing to unlock
-	lock_unlock(height - 1, height, m_tip.timestamp_unlock, header.timestamp_unlock, false);
-	DeltaState delta_state(height, header.timestamp_unlock);
-	Hash base_hash = pb.base_transaction_hash;  // get_transaction_hash(pb.base_transaction.tx);
-	if (!redo_transaction(
-	        pb.base_transaction, global_indices[0], &delta_state, true, base_hash, header.hash, pb.header.timestamp)) {
-	}  // Just ignore
+bool WalletState::redo_block(
+    const PreparedWalletBlock &pb, const std::vector<std::vector<size_t>> &stack_indexes, Height height) {
+	//	invariant(height == get_tip_height() + 1, "Redo of incorrect block height");
+	if (stack_indexes.size() != pb.transactions.size())
+		return false;  // Bad node - TODO
+	size_t key_outputs_count = 0;
+	for (const auto &tx : pb.transactions)
+		key_outputs_count += get_tx_key_outputs_count(tx.tx);
+	DeltaState delta_state;
+	size_t start_global_key_output_index = pb.raw_block.header.already_generated_key_outputs - key_outputs_count;
 	for (size_t tx_index = 0; tx_index != pb.transactions.size(); ++tx_index) {
-		const Hash tid = pb.header.transaction_hashes.at(tx_index);
-		if (m_pool_hashes.erase(tid) != 0) {
-			//	std::cout << "RACE remove tx in redo_block tx=" <<
-			// common::pod_to_hex(tid) << std::endl;
-		}
+		const Hash tid = pb.transactions.at(tx_index).tid;
+		if (m_pool_hashes.erase(tid) != 0)
+			remove_transaction_from_mempool(tid, false);
 		m_memory_state.undo_transaction(tid);
-		if (!redo_transaction(pb.transactions.at(tx_index), global_indices.at(tx_index + 1), &delta_state, false, tid,
-		        header.hash, pb.header.timestamp)) {
-		}  // just ignore
+		redo_transaction(pb.transactions.at(tx_index), stack_indexes.at(tx_index), start_global_key_output_index,
+		    &delta_state, tx_index == 0, tid, get_tip_height() + 1, pb.raw_block.header.hash,
+		    pb.raw_block.header.timestamp);
+		start_global_key_output_index += get_tx_key_outputs_count(pb.transactions.at(tx_index).tx);
 	}
-	try {
-		delta_state.apply(this);
-	} catch (const std::exception &ex) {
-		std::cout << "Exception in delta_state.apply, probably out of disk space ex.what=" << ex.what() << std::endl;
-		std::exit(api::BYTECOIND_DATABASE_ERROR);
-	}
+	invariant(pb.raw_block.header.already_generated_key_outputs == start_global_key_output_index, "");
+	// no exceptions starting from here
+	delta_state.apply(this, get_tip_height() + 1);
+	unlock(height, pb.raw_block.header.timestamp_median);
+	// till here
+	// If ex has lock_time in the past, it will be added to lock index in redo, then immediately unlocked here
 	return true;
 }
 
-void WalletState::undo_block(Height height) {
-	try {
-		auto prefix = HEIGHT_KEYIMAGE_PREFIX + DB::to_ascending_key(height) + "/";
-		for (DB::Cursor cur = m_db.begin(prefix); !cur.end(); cur.erase()) {
-			KeyImage ki;
-			from_binary_key(cur.get_suffix(), ki);
-			undo_height_keyimage(height, ki);
-		}
-		prefix = HEIGHT_OUTPUT_PREFIX + DB::to_ascending_key(height) + "/";
-		for (DB::Cursor cur = m_db.begin(prefix); !cur.end(); cur.erase()) {
-			api::Output output;
-			seria::from_binary(output, cur.get_value_array());
-			undo_keyimage_output(output);
-		}
-		// Undo history here
-		prefix = HEIGHT_TRANSACTION_PREFIX + DB::to_ascending_key(height) + "/";
-		for (DB::Cursor cur = m_db.begin(prefix); !cur.end(); cur.erase()) {
-			Hash tid;
-			from_binary_key(cur.get_suffix(), tid);
-			undo_transaction(height, tid);
-		}
-
-		api::BlockHeader prev_header;
-		if (!read_chain(height - 1, prev_header))
-			return;  // If we are just undone tail block, there should be no outputs, so
-		// nothing to lock
-		lock_unlock(height - 1, height, prev_header.timestamp_unlock, m_tip.timestamp_unlock, true);
-	} catch (const std::exception &ex) {
-		std::cout << "Exception in WalletState undo_block, probably out of disk space ex.what=" << ex.what()
-		          << std::endl;
-		std::exit(api::BYTECOIND_DATABASE_ERROR);
-	}
-}
-
-bool WalletState::parse_raw_transaction(api::Transaction &ptx, const TransactionPrefix &tx, Hash tid) const {
-	std::vector<uint32_t> global_indices(tx.outputs.size(), 0);
-	Amount output_amount;
-	PreparedWalletTransaction pwtx(TransactionPrefix(tx), m_wallet.get_view_secret_key());
-	if (!parse_raw_transaction(ptx, output_amount, pwtx, tid, global_indices, get_tip_height(),
-	        get_tip().timestamp_unlock))  // TODO +1 ?
-		return false;
-	Amount input_amount = 0;
-	std::map<std::string, api::Transfer> transfer_map2;
-	api::Transfer input_transfer;
-	// We do not know "from" addresses, so leave address empty
-	input_transfer.ours = true;
-	for (const auto &input : tx.inputs) {
-		if (input.type() == typeid(KeyInput)) {
-			const KeyInput &in = boost::get<KeyInput>(input);
-			input_amount += in.amount;
-			ptx.fee += in.amount;
-			ptx.anonymity = std::min(ptx.anonymity, static_cast<uint32_t>(in.output_indexes.size() - 1));
-			auto key      = KEYIMAGE_PREFIX + to_binary_key(in.key_image);
-			BinaryArray rb;
-			if (m_db.get(key, rb)) {
-				api::Output output;
-				seria::from_binary(output, rb);
-
-				api::Transfer &transfer = transfer_map2[output.address];
-				transfer.amount -= static_cast<SignedAmount>(output.amount);
-				transfer.ours = true;
-				transfer.outputs.push_back(output);
-			} else
-				input_transfer.amount -= static_cast<SignedAmount>(in.amount);
-		}
-	}
-	for (auto &&tm : transfer_map2) {
-		tm.second.address = tm.first;
-		ptx.transfers.push_back(tm.second);
-	}
-	if (input_transfer.amount != 0)
-		ptx.transfers.push_back(input_transfer);
-	ptx.amount = std::max(input_amount, output_amount);
-	if (ptx.anonymity == std::numeric_limits<uint32_t>::max())
-		ptx.anonymity = 0;  // No key inputs
-	return true;
-}
-
-bool WalletState::parse_raw_transaction(api::Transaction &ptx, Amount &output_amount,
-    const PreparedWalletTransaction &pwtx, Hash tid, const std::vector<uint32_t> &global_indices, Height block_height,
-    Timestamp block_unlock_timestamp) const {
-	if (global_indices.size() != pwtx.tx.outputs.size())  // Bad node
-		return false;
+// We return output transfers in ptx, input transfers in input_transfers
+bool WalletState::parse_raw_transaction(bool is_base, api::Transaction *ptx,
+    std::vector<api::Transfer> *input_transfers, std::vector<api::Transfer> *output_transfers,
+    Amount *unrecognized_inputs_amount, const PreparedWalletTransaction &pwtx, Hash tid,
+    const std::vector<size_t> &stack_indexes, size_t start_global_key_output_index, Height block_height) const {
+	if (stack_indexes.size() != pwtx.tx.outputs.size())  // Bad node
+		return false;                                    // Without stack indexes we cannot do anything with transaction
 	const TransactionPrefix &tx = pwtx.tx;
-	PublicKey tx_public_key     = get_transaction_public_key_from_extra(tx.extra);
-	if (pwtx.derivation == KeyDerivation{})
-		return false;
-	Wallet::History history = m_wallet.load_history(tid);
-//	if(!history.empty()){
-//		std::cout << "Found history for transaction " << common::pod_to_hex(tid) << std::endl;
-//	}
+	const bool is_tx_amethyst   = tx.version >= m_currency.amethyst_transaction_version;
+	boost::optional<Wallet::History> history;
 	KeyPair tx_keys;
-	ptx.hash         = tid;
-	ptx.block_height = block_height;
-	ptx.anonymity    = std::numeric_limits<uint32_t>::max();
-	ptx.unlock_time  = tx.unlock_time;
-	const bool tx_unlocked =
-	    m_currency.is_transaction_spend_time_unlocked(ptx.unlock_time, block_height, block_unlock_timestamp);
-	ptx.public_key = tx_public_key;
-	ptx.extra      = tx.extra;
-	get_payment_id_from_tx_extra(tx.extra, ptx.payment_id);
-	size_t key_index   = 0;
-	uint32_t out_index = 0;
-	output_amount      = 0;
-	// We combine outputs into transfers by address
-	std::map<AccountPublicAddress, api::Transfer> transfer_map;
-	for (const auto &output : tx.outputs) {
-		const auto global_index = global_indices.at(out_index);
-		output_amount += output.amount;
-		ptx.fee -= output.amount;
-		if (output.target.type() == typeid(KeyOutput)) {
-			const KeyOutput &key_output = boost::get<KeyOutput>(output.target);
-			PublicKey spend_key         = pwtx.spend_keys.at(key_index);
-			bool our_key                = false;
-			if (spend_key != PublicKey{}) {
-				auto sk = m_wallet.get_records().find(spend_key);
-				if (sk != m_wallet.get_records().end()) {
-					KeyPair in_ephemeral;
-					if (derive_public_key(pwtx.derivation, out_index, spend_key, in_ephemeral.public_key)) {
-						derive_secret_key(
-						    pwtx.derivation, out_index, sk->second.spend_secret_key, in_ephemeral.secret_key);
-						//	std::cout << "My output!
-						// out_index=" << out_index << "amount=" << output.amount << std::endl;
-						AccountPublicAddress address{spend_key, m_wallet.get_view_public_key()};
-						api::Output out;
-						out.amount               = output.amount;
-						out.dust                 = Currency::is_dust(output.amount);
-						out.global_index         = global_index;
-						out.height               = block_height;
-						out.index_in_transaction = out_index;
-						generate_key_image(in_ephemeral.public_key, in_ephemeral.secret_key, out.key_image);
-						out.public_key             = key_output.key;
-						out.transaction_public_key = tx_public_key;
-						out.unlock_time            = tx.unlock_time;
-						api::Transfer &transfer    = transfer_map[address];
-						transfer.amount += output.amount;
-						transfer.ours = true;
-						transfer.outputs.push_back(out);
-						our_key = true;
-					}
-				}
+	ptx->coinbase                  = is_base;
+	ptx->hash                      = tid;
+	ptx->inputs_hash               = pwtx.inputs_hash;
+	ptx->prefix_hash               = pwtx.prefix_hash;
+	ptx->block_height              = block_height;
+	ptx->anonymity                 = std::numeric_limits<size_t>::max();
+	ptx->unlock_block_or_timestamp = tx.unlock_block_or_timestamp;
+	extra::get_transaction_public_key(tx.extra, &ptx->public_key);
+	ptx->extra = tx.extra;
+	extra::get_payment_id(tx.extra, &ptx->payment_id);
+
+	bool our_inputs  = false;
+	bool our_outputs = false;
+
+	std::map<std::string, api::Transfer> transfer_map_inputs;
+	*unrecognized_inputs_amount = 0;
+	Amount input_amount         = 0;
+	for (size_t in_index = 0; in_index != tx.inputs.size(); ++in_index) {
+		const auto &input = tx.inputs.at(in_index);
+		if (const InputKey *in = boost::get<InputKey>(&input)) {
+			input_amount += in->amount;
+			ptx->anonymity = std::min(ptx->anonymity, in->output_indexes.size() - 1);
+			api::Output existing_output;
+
+			if (try_adding_incoming_keyimage(in->key_image, &existing_output)) {
+				api::Transfer &transfer = transfer_map_inputs[existing_output.address];
+				transfer.amount -= static_cast<SignedAmount>(existing_output.amount);
+				transfer.ours = true;
+				transfer.outputs.push_back(existing_output);
+				our_inputs = true;
+				continue;
 			}
-			if (!our_key && !history.empty()) {
-				if (tx_keys.secret_key == SecretKey{})
-					tx_keys = TransactionBuilder::deterministic_keys_from_seed(tx, m_wallet.get_tx_derivation_seed());
-				for (auto &&addr : history) {
-					PublicKey guess_key{};
-					TransactionBuilder::derive_public_key(addr, tx_keys.secret_key, out_index, guess_key);
-					if (guess_key == key_output.key) {
-						api::Output out;
-						out.amount       = output.amount;
-						out.dust         = Currency::is_dust(output.amount);
-						out.global_index = global_index;
-						out.height       = block_height;
-						// We cannot generate key_image for others addresses
-						out.index_in_transaction   = out_index;
-						out.public_key             = key_output.key;
-						out.transaction_public_key = tx_public_key;
-						out.unlock_time            = tx.unlock_time;
-						api::Transfer &transfer    = transfer_map[addr];
-						transfer.amount += output.amount;
-						transfer.ours = false;
-						transfer.outputs.push_back(out);
-					}
-				}
-			}
-			++key_index;
+			*unrecognized_inputs_amount += in->amount;
 		}
-		++out_index;
 	}
-	for (auto &&tm : transfer_map) {
-		tm.second.address = m_currency.account_address_as_string(tm.first);
-		tm.second.locked  = !tx_unlocked;
-		for (auto &&out : tm.second.outputs)
-			out.address = tm.second.address;
-		ptx.transfers.push_back(std::move(tm.second));
+	for (auto &&tm : transfer_map_inputs) {
+		tm.second.address          = tm.first;
+		tm.second.transaction_hash = tid;
+		input_transfers->push_back(tm.second);
+	}
+	// We combine outputs into transfers by address
+	Amount output_amount = 0;
+	std::map<AccountAddress, api::Transfer> transfer_map_outputs[2];  // We index by ours
+	size_t key_out_index = 0;
+	for (size_t out_index = 0; out_index != tx.outputs.size(); ++out_index) {
+		const auto &output = tx.outputs.at(out_index);
+		if (output.type() != typeid(OutputKey))
+			continue;
+		const auto &key_output         = boost::get<OutputKey>(output);
+		const auto &address_S          = pwtx.address_public_keys.at(key_out_index);
+		PublicKey output_shared_secret = pwtx.output_shared_secrets.at(key_out_index);
+		key_out_index += 1;
+		output_amount += key_output.amount;  // will overflow when hidden amounts
+		api::Output out;
+		out.global_index = start_global_key_output_index;
+		start_global_key_output_index += 1;
+		out.amount                    = key_output.amount;
+		out.stack_index               = stack_indexes.at(out_index);
+		out.height                    = block_height;
+		out.index_in_transaction      = out_index;
+		out.public_key                = key_output.public_key;
+		out.transaction_hash          = tid;
+		out.unlock_block_or_timestamp = tx.unlock_block_or_timestamp;
+
+		AccountAddress address;
+		size_t record_index = 0;
+		SecretKey output_secret_key_s, output_secret_key_a;
+		if (m_wallet.detect_our_output(tx.version, pwtx.inputs_hash, pwtx.derivation, out_index, address_S,
+		        output_shared_secret, key_output, &out.amount, &output_secret_key_s, &output_secret_key_a, &address,
+		        &record_index, &out.key_image)) {
+			api::Transfer &transfer = transfer_map_outputs[true][address];
+			if (transfer.address.empty())
+				transfer.address = m_currency.account_address_as_string(address);
+			out.address = transfer.address;
+			if (try_add_incoming_output(out)) {
+				transfer.amount += out.amount;
+				transfer.outputs.push_back(out);
+				our_outputs = true;
+			} else {
+				if (transfer.outputs.empty()) {
+					// Rare situation. We so not want transfers without outputs
+					transfer_map_outputs[true].erase(address);
+				}
+			}
+			continue;
+		}
+		if (!our_inputs)
+			continue;
+		if (TransactionBuilder::detect_not_our_output(&m_wallet, is_tx_amethyst, tid, pwtx.inputs_hash, &history,
+		        &tx_keys, out_index, key_output, &address, &output_shared_secret)) {
+			api::Transfer &transfer = transfer_map_outputs[false][address];
+			if (transfer.address.empty())
+				transfer.address = m_currency.account_address_as_string(address);
+			out.address = transfer.address;
+			transfer.amount += key_output.amount;
+			transfer.outputs.push_back(out);
+			continue;
+		}
+		if (is_tx_amethyst && m_wallet.can_view_outgoing_addresses())
+			m_log(logging::WARNING) << "Auditor warning - failed to detect destination address for output #"
+			                        << out_index << " in tx " << tid;
+	}
+	auto encrypted_messages = extra::get_encrypted_messages(tx.extra);
+	for (size_t m_index = 0; m_index != encrypted_messages.size(); ++m_index) {
+		const auto &em                 = encrypted_messages.at(m_index);
+		const size_t fake_output_index = tx.outputs.size() + m_index;
+		const auto &address_S          = pwtx.address_public_keys.at(key_out_index);
+		PublicKey output_shared_secret = pwtx.output_shared_secrets.at(key_out_index);
+		key_out_index += 1;
+
+		Amount amount = 0;
+		AccountAddress address;
+		size_t record_index = 0;
+		KeyImage key_image;
+		SecretKey output_secret_key_s, output_secret_key_a;
+		if (m_wallet.detect_our_output(tx.version, pwtx.inputs_hash, pwtx.derivation, fake_output_index, address_S,
+		        output_shared_secret, em.output, &amount, &output_secret_key_s, &output_secret_key_a, &address,
+		        &record_index, &key_image)) {
+			api::Transfer &transfer = transfer_map_outputs[true][address];
+			if (transfer.address.empty())
+				transfer.address = m_currency.account_address_as_string(address);
+			transfer.message += TransactionBuilder::decrypt_message_chunk(em.message, output_shared_secret);
+			continue;
+		}
+		if (!our_inputs)
+			continue;
+		if (TransactionBuilder::detect_not_our_output(&m_wallet, is_tx_amethyst, tid, pwtx.inputs_hash, &history,
+		        &tx_keys, fake_output_index, em.output, &address, &output_shared_secret)) {
+			api::Transfer &transfer = transfer_map_outputs[false][address];
+			if (transfer.address.empty())
+				transfer.address = m_currency.account_address_as_string(address);
+			transfer.message += TransactionBuilder::decrypt_message_chunk(em.message, output_shared_secret);
+			continue;
+		}
+		if (is_tx_amethyst && m_wallet.can_view_outgoing_addresses())
+			m_log(logging::WARNING) << "Auditor warning - failed to detect destination address for encrypted message #"
+			                        << m_index << " in tx " << tid;
+	}
+	for (bool ours : {false, true})
+		for (auto &&tm : transfer_map_outputs[ours]) {
+			tm.second.locked           = ptx->unlock_block_or_timestamp != 0;
+			tm.second.ours             = ours;
+			tm.second.transaction_hash = tid;
+			output_transfers->push_back(std::move(tm.second));
+		}
+	ptx->amount = output_amount;
+	if (output_amount > input_amount && !is_base)
+		return false;
+	if (input_amount >= output_amount)
+		ptx->fee = input_amount - output_amount;
+	if (ptx->anonymity == std::numeric_limits<size_t>::max())
+		ptx->anonymity = 0;  // No key inputs
+	return our_outputs || our_inputs;
+}
+
+bool WalletState::add_incoming_output(const api::Output &output) {
+	m_memory_state.add_keyimage_from_block(output.key_image);
+	return WalletStateBasic::add_incoming_output(output);
+}
+
+bool WalletState::parse_raw_transaction(
+    bool is_base, api::Transaction &ptx, Transaction &&tx, Hash tid, size_t tx_size) const {
+	std::vector<size_t> stack_indexes(tx.outputs.size(), 0);
+	Amount unrecognized_inputs_amount = 0;
+	PreparedWalletTransaction pwtx;
+	pwtx = PreparedWalletTransaction(
+	    tid, tx_size, std::move(tx), m_wallet.get_output_handler(), m_wallet.get_view_secret_key());
+	std::vector<api::Transfer> input_transfers;
+	std::vector<api::Transfer> output_transfers;
+	parse_raw_transaction(is_base, &ptx, &input_transfers, &output_transfers, &unrecognized_inputs_amount, pwtx, tid,
+	    stack_indexes, 0, get_tip_height());
+
+	// We do not know "from" addresses, so leave address empty
+	ptx.transfers.insert(ptx.transfers.end(), input_transfers.begin(), input_transfers.end());
+	ptx.transfers.insert(ptx.transfers.end(), output_transfers.begin(), output_transfers.end());
+	if (unrecognized_inputs_amount != 0) {
+		api::Transfer input_transfer;
+		input_transfer.amount = -static_cast<SignedAmount>(unrecognized_inputs_amount);
+		input_transfer.ours   = true;
+		ptx.transfers.push_back(input_transfer);
 	}
 	return true;
 }
 
-bool WalletState::redo_transaction(const PreparedWalletTransaction &pwtx, const std::vector<uint32_t> &global_indices,
-    DeltaState *delta_state, bool is_base, Hash tid, Hash bid, Timestamp tx_timestamp) {
+const std::map<KeyImage, std::vector<Hash>> &WalletState::get_mempool_keyimages() const {
+	return m_memory_state.get_used_keyimages();
+}
+
+void WalletState::on_first_transaction_found(Timestamp ts) {
+	if (!m_wallet.is_amethyst())  // TODO - discuss with team
+		m_wallet.on_first_output_found(ts);
+}
+
+bool WalletState::redo_transaction(const PreparedWalletTransaction &pwtx, const std::vector<size_t> &stack_indexes,
+    size_t start_global_key_output_index, IWalletState *delta_state, bool is_base, Hash tid, Height block_height,
+    Hash bid, Timestamp tx_timestamp) const {
 	api::Transaction ptx;
-	Amount output_amount = 0;
-	if (!parse_raw_transaction(ptx, output_amount, pwtx, tid, global_indices, delta_state->get_block_height(),
-	        delta_state->get_unlock_timestamp()))
+	ptx.size                          = pwtx.size;
+	Amount unrecognized_inputs_amount = 0;
+	std::vector<api::Transfer> input_transfers;
+	std::vector<api::Transfer> output_transfers;
+	const bool updating_pool = delta_state == &m_memory_state;  // TODO - refactor
+	const bool ours          = parse_raw_transaction(is_base, &ptx, &input_transfers, &output_transfers,
+        &unrecognized_inputs_amount, pwtx, tid, stack_indexes, start_global_key_output_index, block_height);
+	if (!ours && !updating_pool)
 		return false;
-	bool our_transaction = false;
-	for (auto &&tr : ptx.transfers) {
+	// We add all transactions in pool, because
+	// We may not generally know if transaction is ours or not if bytecoind is lagged
+	// If we then discover our output with keyimage in pool, we will reapply that transaction
+	ptx.block_hash = bid;
+	ptx.timestamp  = tx_timestamp;
+	ptx.transfers.insert(ptx.transfers.end(), input_transfers.begin(), input_transfers.end());
+	ptx.transfers.insert(ptx.transfers.end(), output_transfers.begin(), output_transfers.end());
+	delta_state->add_transaction(block_height, tid, pwtx, ptx);
+	// order of add_transaction is important - DeltaState associates subsequent add_ with last added transaction
+	for (auto &&tr : output_transfers) {  // add and fix outputs
 		if (!tr.ours)
 			continue;
-		our_transaction = true;
-		for (auto &&out : tr.outputs)
-			delta_state->redo_keyimage_output(out, 0, 0);  // TODO - refactor
-	}
-	ptx.block_hash = bid;
-	ptx.coinbase   = is_base;
-	ptx.timestamp  = tx_timestamp;
-	std::map<std::string, api::Transfer> transfer_map2;
-	Amount input_amount = 0;
-	for (const auto &input : pwtx.tx.inputs) {
-		if (input.type() == typeid(CoinbaseInput)) {
-			// Just ignore
-		} else if (input.type() == typeid(KeyInput)) {
-			const KeyInput &in = boost::get<KeyInput>(input);
-			input_amount += in.amount;
-			ptx.fee += in.amount;
-			ptx.anonymity = std::min(ptx.anonymity, static_cast<uint32_t>(in.output_indexes.size()));
-			auto key      = KEYIMAGE_PREFIX + to_binary_key(in.key_image);
-			BinaryArray rb;
-			if (m_db.get(key, rb)) {
-				api::Output output;
-				seria::from_binary(output, rb);
-
-				api::Transfer &transfer = transfer_map2[output.address];
-				transfer.amount -= static_cast<SignedAmount>(output.amount);
-				transfer.ours = true;
-				transfer.outputs.push_back(output);
-				our_transaction = true;
-
-				delta_state->redo_height_keyimage(delta_state->get_block_height(), in.key_image);
-			}
+		for (auto &&out : tr.outputs) {
+			invariant(delta_state->add_incoming_output(out), "");  // TODO - double check before 3.5
 		}
 	}
-	for (auto &&tm : transfer_map2) {
-		tm.second.address = tm.first;
-		ptx.transfers.push_back(tm.second);
+	for (size_t in_index = 0; in_index != pwtx.tx.inputs.size(); ++in_index) {
+		const auto &input = pwtx.tx.inputs.at(in_index);
+		if (const InputKey *in = boost::get<InputKey>(&input))
+			delta_state->add_incoming_keyimage(block_height, in->key_image);
 	}
-	ptx.amount = std::max(input_amount, output_amount);
-	if (ptx.anonymity == std::numeric_limits<uint32_t>::max())
-		ptx.anonymity = 0;  // No key inputs
-	if (is_base)
-		ptx.fee = 0;
-	if (our_transaction)
-		delta_state->redo_transaction(delta_state->get_block_height(), tid, pwtx.tx, ptx);
+	//	for (auto &&tr : input_transfers) {
+	//		for (auto &&out : tr.outputs) {
+	//			delta_state->add_incoming_keyimage(block_height, out.key_image);
+	//		}
+	//	}
 	return true;
 }
 
-bool WalletState::read_tips() {
-	BinaryArray rb;
-	if (!m_db.get("$genesis_bid", rb))
-		return false;
-	Hash other_genesis_bid;
-	seria::from_binary(other_genesis_bid, rb);
-	if (m_genesis_bid != other_genesis_bid)  // TODO - return error or clear DB
-		throw std::runtime_error("Database holds different genesis bid");
-	std::string val1;
-	if (!m_db.get("$tip_height", val1))
-		throw std::logic_error("Database holds no tip_height");
-	m_tip_height = boost::lexical_cast<Height>(val1);
-	if (!m_db.get("$tail_height", val1))
-		throw std::logic_error("Database holds no tail_height");
-	m_tail_height = boost::lexical_cast<Height>(val1);
-	m_tip         = (m_tip_height + 1 == m_tail_height) ? api::BlockHeader{} : read_chain(m_tip_height);
-	return true;
-}
-
-void WalletState::push_chain(const api::BlockHeader &header) {
-	m_tip_height += 1;
-	BinaryArray ba = seria::to_binary(header);
-	m_db.put(TIP_CHAIN_PREFIX + DB::to_ascending_key(m_tip_height), ba, true);
-	m_db.put("$tip_height", common::to_string(m_tip_height), false);
-	m_tip = header;
-	m_db.put("$tail_height", common::to_string(m_tail_height), false);
-	m_memory_state.set_height(m_tip_height + 1);
-}
-
-void WalletState::pop_chain() {
-	if (m_tip_height + 1 == m_tail_height)
-		throw std::logic_error("pop_chain tip_height == -1");
-	m_db.del(TIP_CHAIN_PREFIX + DB::to_ascending_key(m_tip_height), true);
-	m_tip_height -= 1;
-	m_db.put("$tip_height", common::to_string(m_tip_height), false);
-	m_tip = (m_tip_height + 1 == m_tail_height) ? api::BlockHeader{} : read_chain(m_tip_height);
-}
-
-bool WalletState::read_chain(uint32_t height, api::BlockHeader &header) const {
-	BinaryArray rb;
-	if (!m_db.get(TIP_CHAIN_PREFIX + DB::to_ascending_key(height), rb))
-		return false;
-	seria::from_binary(header, rb);
-	return true;
-}
-
-api::BlockHeader WalletState::read_chain(uint32_t height) const {
-	api::BlockHeader ha;
-	if (!read_chain(height, ha))
-		throw std::logic_error("read_header_chain failed");
-	return ha;
-}
-
-void WalletState::redo_transaction(
-    Height height, const Hash &tid, const TransactionPrefix &tx, const api::Transaction &ptx) {
-	auto cur = m_db.begin(TRANSACTION_PREFIX);
-	if (cur.end())
-		m_wallet.on_first_output_found(ptx.timestamp);
-	auto trkey         = TRANSACTION_PREFIX + to_binary_key(tid);
-	auto hetrkey       = HEIGHT_TRANSACTION_PREFIX + DB::to_ascending_key(height) + "/" + to_binary_key(tid);
-	BinaryArray str_pa = seria::to_binary(std::make_pair(tx, ptx));
-	BinaryArray str    = seria::to_binary(ptx);
-	m_db.put(trkey, str_pa, true);
-	m_db.put(hetrkey, str, true);
-	std::set<std::string> addresses;
-	for (auto &&transfer : ptx.transfers) {
-		addresses.insert(transfer.address);
-	}
-	for (auto &&addr : addresses) {
-		auto adtrkey =
-		    ADDRESS_HEIGHT_TRANSACTION_PREFIX + addr + "/" + DB::to_ascending_key(height) + "/" + to_binary_key(tid);
-		m_db.put(adtrkey, str, true);
-	}
-}
-
-void WalletState::undo_transaction(Height height, const Hash &tid) {
-	auto trkey   = TRANSACTION_PREFIX + to_binary_key(tid);
-	auto hetrkey = HEIGHT_TRANSACTION_PREFIX + DB::to_ascending_key(height) + "/" + to_binary_key(tid);
-	BinaryArray data;
-	if (!m_db.get(trkey, data))
-		throw std::logic_error("Invariant dead - transaction does not exist in undo_transaction");
-	std::pair<TransactionPrefix, api::Transaction> pa;
-	seria::from_binary(pa, data);
-	m_db.del(trkey, true);
-	//	db.del(hetrkey, true); // Will be deleted during iteration
-	std::set<std::string> addresses;
-	for (auto &&transfer : pa.second.transfers) {
-		addresses.insert(transfer.address);
-	}
-	for (auto &&addr : addresses) {
-		auto adtrkey =
-		    ADDRESS_HEIGHT_TRANSACTION_PREFIX + addr + "/" + DB::to_ascending_key(height) + "/" + to_binary_key(tid);
-		m_db.del(adtrkey, true);
-	}
-}
-
-void WalletState::add_to_lock_index(const api::Output &output) {
-	//	std::cout << "Lock am=" << output.amount / 1E8 << " gi=" <<
-	// output.global_index << " un=" << output.unlock_time << std::endl;
-	BinaryArray ba = seria::to_binary(output);
-
-	std::string unkey;
-	uint32_t clamped_unlock_time = static_cast<uint32_t>(std::min<UnlockMoment>(output.unlock_time, 0xFFFFFFFF));
-	if (m_currency.is_transaction_spend_time_block(output.unlock_time))
-		unkey = UNLOCK_BLOCK_PREFIX + DB::to_ascending_key(clamped_unlock_time) + "/" +
-		        common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	else
-		unkey = UNLOCK_TIME_PREFIX + DB::to_ascending_key(clamped_unlock_time) + "/" +
-		        common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	m_db.put(unkey, ba, true);
-}
-
-bool WalletState::remove_from_lock_index(const api::Output &output, bool mustexist) {
-	//	std::cout << "Unlock am=" << output.amount / 1E8 << " gi=" <<
-	// output.global_index << " un=" << output.unlock_time << std::endl;
-	std::string unkey;
-	uint32_t clamped_unlock_time = static_cast<uint32_t>(std::min<UnlockMoment>(output.unlock_time, 0xFFFFFFFF));
-	if (m_currency.is_transaction_spend_time_block(output.unlock_time))
-		unkey = UNLOCK_BLOCK_PREFIX + DB::to_ascending_key(clamped_unlock_time) + "/" +
-		        common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	else
-		unkey = UNLOCK_TIME_PREFIX + DB::to_ascending_key(clamped_unlock_time) + "/" +
-		        common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	std::string was_value;
-	if (!mustexist && !m_db.get(unkey, was_value))
-		return false;
-	m_db.del(unkey, true);
-	return true;
-}
-
-void WalletState::add_to_unspent_index(const api::Output &output) {
-	//	if (output.unlock_time)
-	//		std::cout << "Add unspent am=" << output.amount / 1E8 << " gi="
-	//	<< output.global_index
-	//		          << " un=" << output.unlock_time << std::endl;
-	modify_balance(output, 0, 1);
-	auto keyuns = UNSPENT_HEIGHT_PREFIX + output.address + "/" + DB::to_ascending_key(output.height) + "/" +
-	              common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	BinaryArray ba2 = seria::to_binary(output);
-	m_db.put(keyuns, ba2, true);
-
-	auto hekeyuns = HEIGHT_UNSPENT_PREFIX + DB::to_ascending_key(output.height) + "/" + output.address + "/" +
-	                common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	m_db.put(hekeyuns, ba2, true);
-}
-
-void WalletState::remove_from_unspent_index(const api::Output &output) {
-	//	if (output.unlock_time)
-	//		std::cout << "Remove unspent am=" << output.amount / 1E8 << "
-	// gi=" << output.global_index
-	//		          << " un=" << output.unlock_time << std::endl;
-	modify_balance(output, 0, -1);
-	auto keyuns = UNSPENT_HEIGHT_PREFIX + output.address + "/" + DB::to_ascending_key(output.height) + "/" +
-	              common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	m_db.del(keyuns, true);
-	auto hekeyuns = HEIGHT_UNSPENT_PREFIX + DB::to_ascending_key(output.height) + "/" + output.address + "/" +
-	                common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	m_db.del(hekeyuns, true);
-}
-
-bool WalletState::is_unspent(const api::Output &output) const {
-	BinaryArray ba = seria::to_binary(output);
-	auto keyuns    = UNSPENT_HEIGHT_PREFIX + output.address + "/" + DB::to_ascending_key(output.height) + "/" +
-	              common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-	return m_db.get(keyuns, ba);
-}
-
-static void combine_balance(api::Balance &balance, const api::Output &output, int locked_op, int spendable_op) {
-	Amount &mod = output.dust ? balance.spendable_dust : balance.spendable;
-	if (locked_op > 0)
-		balance.locked_or_unconfirmed += output.amount;
-	if (locked_op < 0)
-		balance.locked_or_unconfirmed -= output.amount;
-	if (spendable_op > 0)
-		mod += output.amount;
-	if (spendable_op < 0)
-		mod -= output.amount;
-}
-
-void WalletState::modify_balance(const api::Output &output, int locked_op, int spendable_op) {
-	auto bakey  = ADDRESS_BALANCE_PREFIX + output.address;
-	auto bakey2 = BALANCE_PREFIX;
-	BinaryArray ba;
-	api::Balance balance;
-	api::Balance balance2;
-	if (m_db.get(bakey, ba))
-		seria::from_binary(balance, ba);
-	if (m_db.get(bakey2, ba))
-		seria::from_binary(balance2, ba);
-	//	std::cout << "modify_balance " << output.amount << " locked_op=" <<
-	// locked_op << " spendable_op=" << spendable_op << std::endl;
-	combine_balance(balance, output, locked_op, spendable_op);
-	combine_balance(balance2, output, locked_op, spendable_op);
-	if (balance.total() == 0)
-		m_db.del(bakey, false);
-	else
-		m_db.put(bakey, seria::to_binary(balance), false);
-	if (balance2.total() == 0)
-		m_db.del(bakey2, false);
-	else
-		m_db.put(bakey2, seria::to_binary(balance2), false);
-}
-
-// Add new unspent
-void WalletState::redo_keyimage_output(const api::Output &output,
-    Height block_height,
-    Timestamp block_unlock_timestamp) {
-	BinaryArray ba = seria::to_binary(output);
-
-	auto kikey = KEYIMAGE_PREFIX + to_binary_key(output.key_image);
-	BinaryArray ba2;
-	if (m_db.get(kikey, ba2)) {
-		// Protect against an attack with 2 identical output.public_key (and hence
-		// keyimages) in 2 different transactions
-		return;
-	}
-	m_db.put(kikey, ba, true);
-	auto keyout = HEIGHT_OUTPUT_PREFIX + DB::to_ascending_key(output.height) + "/" + common::to_string(output.amount) +
-	              "/" + common::to_string(output.global_index);
-	m_db.put(keyout, ba, true);
-
-	if (!m_currency.is_transaction_spend_time_unlocked(output.unlock_time, block_height, block_unlock_timestamp)) {
-		add_to_lock_index(output);
-		modify_balance(output, 1, 0);
-		return;
-	}
-	add_to_unspent_index(output);
-}
-
-// Undo unspent
-void WalletState::undo_keyimage_output(const api::Output &output) {
-	auto kikey = KEYIMAGE_PREFIX + to_binary_key(output.key_image);
-	BinaryArray ba2;
-	if (!m_db.get(kikey, ba2))
-		throw std::logic_error("Keyimage not found for undo, invariant dead");
-	api::Output was_output;
-	seria::from_binary(was_output, ba2);
-	if (output.amount != was_output.amount || output.global_index != was_output.global_index) {
-		// Protect against an attack with 2 identical output.public_key (and hence
-		// keyimages) in 2 different transactions
-		// Subsequent outputs cannot have the same global_index, as global_index is
-		// incremented on each output
-		return;
-	}
-	m_db.del(kikey, true);
-
-	if (!m_currency.is_transaction_spend_time_unlocked(output.unlock_time, m_tip_height, m_tip.timestamp_unlock)) {
-		modify_balance(output, -1, 0);
-		remove_from_lock_index(output, true);
-		return;
-	}
-	remove_from_unspent_index(output);  // We remove height_unspent during iteration
-}
-
-// Unique in that it reads (begin, end] interval, not [begin, end) as most other
-// funs. That is because block height 312
-// unlocks output with unlock_time=312
-void WalletState::read_unlock_index(std::map<std::pair<Amount, uint32_t>, api::Output> &add,
-    const std::string &index_prefix, uint32_t begin, uint32_t end) const {
-	if (begin >= end)  // optimization
-		return;
-	auto middle = DB::to_ascending_key(begin + 1) + "/";
-	for (DB::Cursor cur = m_db.begin(index_prefix, middle); !cur.end(); cur.next()) {
-		std::string svalue, rest;
-		if (!common::split_string(cur.get_suffix(), "/", svalue, rest))
-			throw std::logic_error("Invariant dead read_unlock_index corrupted");
-		auto val = DB::from_ascending_key(svalue);
-		if (val > end)
-			break;
-		api::Output output;
-		seria::from_binary(output, cur.get_value_array());
-		add.insert(std::make_pair(std::make_pair(output.amount, output.global_index), output));
-	}
-}
-
-void WalletState::lock_unlock(Height prev_height, Height now_height, Timestamp prev, Timestamp now, bool lock) {
-	std::map<std::pair<Amount, uint32_t>, api::Output> outputs;
-	read_unlock_index(outputs, UNLOCK_BLOCK_PREFIX, prev_height + m_currency.locked_tx_allowed_delta_blocks,
-	    now_height + m_currency.locked_tx_allowed_delta_blocks);
-	read_unlock_index(outputs, UNLOCK_TIME_PREFIX, prev + m_currency.locked_tx_allowed_delta_seconds,
-	    now + m_currency.locked_tx_allowed_delta_seconds);
-
-	for (auto &&mit : outputs)
-		if (lock) {
-			remove_from_unspent_index(mit.second);
-			modify_balance(mit.second, 1, 0);
-		} else {
-			modify_balance(mit.second, -1, 0);
-			add_to_unspent_index(mit.second);
-		}
-}
-
-// Spend unspent
-void WalletState::redo_height_keyimage(Height height, const KeyImage &keyimage) {
-	auto key = KEYIMAGE_PREFIX + to_binary_key(keyimage);
-	BinaryArray rb;
-	if (m_db.get(key, rb)) {
-		api::Output output;
-		seria::from_binary(output, rb);
-
-		// Code below is used temporarily to allow spending locked outputs (due to
-		// changes to unlock code in new version)
-		auto keyuns = UNSPENT_HEIGHT_PREFIX + output.address + "/" + DB::to_ascending_key(output.height) + "/" +
-		              common::to_string(output.amount) + "/" + common::to_string(output.global_index);
-		bool was_unlocked = m_db.get(keyuns, rb);
-		if (was_unlocked)
-			remove_from_unspent_index(output);
-		bool was_in_lockindex = remove_from_lock_index(output, false);
-
-		auto hekey = HEIGHT_KEYIMAGE_PREFIX + DB::to_ascending_key(height) + "/" + to_binary_key(keyimage);
-		m_db.put(hekey, seria::to_binary(std::make_pair(was_unlocked, was_in_lockindex)), true);
-	}
-}
-
-// Undo spend
-void WalletState::undo_height_keyimage(Height height, const KeyImage &keyimage) {
-	auto key = KEYIMAGE_PREFIX + to_binary_key(keyimage);
-	BinaryArray rb;
-	if (!m_db.get(key, rb))
-		throw std::logic_error("Invariant dead undo_height_keyimage keyimage does not exist");
-	api::Output output;
-	seria::from_binary(output, rb);
-	auto hekey = HEIGHT_KEYIMAGE_PREFIX + DB::to_ascending_key(height) + "/" + to_binary_key(keyimage);
-	BinaryArray ba;
-	m_db.get(hekey, ba);
-	std::pair<bool, bool> was_unlocked_was_in_lockindex{};
-	seria::from_binary(was_unlocked_was_in_lockindex, ba);
-
-	if (was_unlocked_was_in_lockindex.second)
-		add_to_lock_index(output);
-	if (was_unlocked_was_in_lockindex.first)
-		add_to_unspent_index(output);
-	//	auto hekey = HEIGHT_KEYIMAGE_PREFIX + DB::to_ascending_key(height) + "/"
-	//+ DB::to_binary_key(keyimage.data,
-	// sizeof(keyimage.data));
-	//	db.del(hekey, true); // Removed during iteration in undo_block
-}
-
-bool WalletState::api_add_unspent(std::vector<api::Output> &result, Amount &total_amount, const std::string &address,
-    Height height, Amount max_amount) const {
-	auto prefix = HEIGHT_UNSPENT_PREFIX;
-	if (!address.empty())
-		prefix            = UNSPENT_HEIGHT_PREFIX + address + "/";
-	auto unlocked_outputs = api_get_unlocked_outputs(address, height, m_tip_height);
-	//	Amount total_amount    = 0;
-	const size_t min_count = 10000;  // We return up to 10k outputs after we find requested sum
-	for (DB::Cursor cur = m_db.begin(prefix); !cur.end(); cur.next()) {
-		std::string shei, rest;
-		if (!common::split_string(cur.get_suffix(), "/", shei, rest))
-			throw std::logic_error("Invariant dead api_get_unspent index corrupted");
-		if (DB::from_ascending_key(shei) > height)
-			break;
-		api::Output item;
-		seria::from_binary(item, cur.get_value_array());
-		if (!m_memory_state.is_spent(item) &&
-		    unlocked_outputs.count(std::make_pair(item.amount, item.global_index)) == 0)
-			result.push_back(item);
-		if (!item.dust)  // We ensure total can be spent with non-zero anonymity
-			total_amount += item.amount;
-		if (total_amount >= max_amount && result.size() >= min_count)
-			return false;  // Stop looking for
-	}
-	return true;
-}
-
-std::vector<api::Output> WalletState::api_get_locked_or_unconfirmed_unspent(const std::string &address,
-    Height height) const {
-	std::vector<api::Output> result;
-	const auto &uns = m_memory_state.get_unspents();
-	if (address.empty()) {
-		for (auto &&auns : uns)
-			for (auto &&out : auns.second)
+std::vector<api::Output> WalletState::api_get_locked_or_unconfirmed_unspent(
+    const std::string &address, Height confirmed_height) const {
+	auto result = WalletStateBasic::api_get_locked_or_unconfirmed_unspent(address, confirmed_height);
+	for (auto &&uns : m_memory_state.get_unspents())
+		for (auto &&out : uns.second)
+			if (address.empty() || address == out.address)
 				result.push_back(out);
-	} else {
-		for (auto &&auns : uns)
-			for (auto &&out : auns.second)
-				if (out.address == address)
-					result.push_back(out);
-	}
-	auto prefix = HEIGHT_UNSPENT_PREFIX;
-	if (!address.empty())
-		prefix         = UNSPENT_HEIGHT_PREFIX + address + "/";
-	std::string middle = common::to_string(height + 1) + "/";
-	for (DB::Cursor cur = m_db.begin(prefix, middle); !cur.end(); cur.next()) {
-		std::string shei, rest;
-		if (!common::split_string(cur.get_suffix(), "/", shei, rest))
-			throw std::logic_error(
-			    "Invariant dead api_get_locked_or_unconfirmed_unspent index "
-			    "corrupted");
-		api::Output item;
-		seria::from_binary(item, cur.get_value_array());
-		if (!m_memory_state.is_spent(item))
-			result.push_back(item);
-	}
-	std::map<std::pair<Amount, uint32_t>, api::Output> locked;
-	read_unlock_index(locked, UNLOCK_BLOCK_PREFIX, m_tip_height, std::numeric_limits<Height>::max());
-	read_unlock_index(locked, UNLOCK_TIME_PREFIX, m_tip.timestamp_unlock, std::numeric_limits<Height>::max());
-	for (auto &&lou : locked) {
-		if (!m_memory_state.is_spent(lou.second))
-			result.push_back(lou.second);
-	}
 	return result;
 }
+api::Balance WalletState::get_balance(const std::string &address, Height confirmed_height) const {
+	auto balance = WalletStateBasic::get_balance(address, confirmed_height);
+	for (auto &&uns : m_memory_state.get_unspents())
+		for (auto &&out : uns.second)
+			if (address.empty() || address == out.address)
+				combine_balance(balance, out, 1, 0);
+	return balance;
+}
 
-std::vector<api::Block> WalletState::api_get_transfers(
-    const std::string &address, Height &from_height, Height &to_height, bool forward, uint32_t desired_tx_count) const {
-	std::vector<api::Block> result;
-	if (from_height >= to_height)
-		return result;
-	auto prefix        = HEIGHT_TRANSACTION_PREFIX;
-	std::string middle = DB::to_ascending_key(forward ? from_height + 1 : to_height) + "/";
-	if (!address.empty())
-		prefix = ADDRESS_HEIGHT_TRANSACTION_PREFIX + address + "/";
-	api::Block current_block;
-	size_t total_transactions_found = 0;
-	for (DB::Cursor cur = forward ? m_db.begin(prefix, middle) : m_db.rbegin(prefix, middle); !cur.end(); cur.next()) {
-		std::string shei, rest;
-		if (!common::split_string(cur.get_suffix(), "/", shei, rest))
-			throw std::logic_error("Invariant dead api_get_transfers index corrupted");
-		Height height = DB::from_ascending_key(shei);
-		if (forward && height > to_height)
-			break;
-		if (!forward && height <= from_height)
-			break;
-		api::Transaction tx;
-		seria::from_binary(tx, cur.get_value_array());
-		if (current_block.header.height != height && !current_block.transactions.empty()) {
-			result.push_back(std::move(current_block));
-			current_block = api::Block();
-			if (total_transactions_found >= desired_tx_count) {
-				if (forward)
-					to_height = height - 1;
-				else
-					from_height = height;
-				break;
-			}
+bool WalletState::api_has_transaction(Hash tid, bool check_pool) const {
+	if (check_pool) {
+		auto mit = m_memory_state.get_transactions().find(tid);
+		if (mit != m_memory_state.get_transactions().end())
+			return true;
+	}
+	return has_transaction(tid);
+}
+
+bool WalletState::api_get_transaction(Hash tid, bool check_pool, TransactionPrefix *tx, api::Transaction *atx) const {
+	if (check_pool) {
+		auto mit = m_memory_state.get_transactions().find(tid);
+		if (mit != m_memory_state.get_transactions().end()) {
+			if (tx)
+				*tx = mit->second.pwtx.tx;
+			if (atx)
+				*atx = mit->second.atx;
+			return true;
 		}
-		if (current_block.transactions.empty()) {
-			read_chain(height, current_block.header);
+	}
+	return get_transaction(tid, tx, atx);
+}
+
+std::string WalletState::api_create_proof(const TransactionPrefix &tx,
+    const std::vector<std::vector<api::Output>> &mixed_outputs, const std::string &addr_str, const Hash &tid,
+    const std::string &message, bool reveal_secret_message) const {
+	const Hash tx_inputs_hash = get_transaction_inputs_hash(tx);
+	const Hash message_hash   = crypto::cn_fast_hash(message.data(), message.size());
+	AccountAddress address;
+	if (!m_currency.parse_account_address_string(addr_str, &address))
+		throw api::ErrorAddress(api::ErrorAddress::ADDRESS_FAILED_TO_PARSE, "Failed to parse wallet address", addr_str);
+	if (tx.version < m_currency.amethyst_transaction_version) {
+		if (address.type() != typeid(AccountAddressLegacy))
+			throw std::runtime_error("Legacy transaction cannot contain amethyst address");
+		SendproofAmethyst sp;
+		sp.version          = tx.version;
+		sp.address_simple   = boost::get<AccountAddressLegacy>(address);
+		sp.message          = message;
+		sp.transaction_hash = tid;
+		KeyPair tx_keys     = Wallet::transaction_keys_from_seed(tx_inputs_hash, m_wallet.get_view_seed());
+		const auto &addr    = boost::get<AccountAddressLegacy>(address);
+		sp.derivation       = crypto::generate_key_derivation(addr.V, tx_keys.secret_key);
+		sp.signature =
+		    crypto::generate_sendproof(tx_keys.public_key, tx_keys.secret_key, addr.V, sp.derivation, message_hash);
+		Amount total_amount = 0;
+		for (size_t out_index = 0; out_index != tx.outputs.size(); ++out_index) {
+			const auto &output = tx.outputs.at(out_index);
+			if (output.type() != typeid(OutputKey))
+				continue;
+			const auto &key_output    = boost::get<OutputKey>(output);
+			const PublicKey address_S = underive_address_S(sp.derivation, out_index, key_output.public_key);
+			if (address_S != addr.S)
+				continue;
+			total_amount += key_output.amount;
 		}
-		current_block.transactions.push_back(std::move(tx));
-		total_transactions_found += 1;
+		if (total_amount == 0)
+			throw std::runtime_error("No outputs to this address in transaction");
+		const auto body = seria::to_binary(sp);
+		return common::base58::encode_addr(m_currency.sendproof_base58_prefix, body);
 	}
-	if (!current_block.transactions.empty()) {
-		result.push_back(std::move(current_block));
-	}
-	return result;
-}
-
-bool WalletState::api_has_transaction(Hash tid) const {
-	auto mit = m_memory_state.get_transactions().find(tid);
-	if (mit != m_memory_state.get_transactions().end())
-		return true;
-	auto trkey = TRANSACTION_PREFIX + to_binary_key(tid);
-	BinaryArray data;
-	return m_db.get(trkey, data);
-}
-
-bool WalletState::api_get_transaction(Hash tid, TransactionPrefix &tx, api::Transaction &ptx) const {
-	auto mit = m_memory_state.get_transactions().find(tid);
-	if (mit != m_memory_state.get_transactions().end()) {
-		tx  = mit->second.first;
-		ptx = mit->second.second;
-		return true;
-	}
-	auto trkey = TRANSACTION_PREFIX + to_binary_key(tid);
-	BinaryArray data;
-	if (!m_db.get(trkey, data))
-		return false;
-	std::pair<TransactionPrefix, api::Transaction> pa;
-	seria::from_binary(pa, data);
-	tx  = std::move(pa.first);
-	ptx = std::move(pa.second);
-	return true;
-}
-
-bool WalletState::api_create_proof(SendProof &sp) const {
-	TransactionPrefix tx;
-	api::Transaction ptx;
-	if (!api_get_transaction(sp.transaction_hash, tx, ptx))
-		return false;
-	KeyPair tx_keys = TransactionBuilder::deterministic_keys_from_seed(tx, m_wallet.get_tx_derivation_seed());
-	if (!crypto::generate_key_derivation(sp.address.view_public_key, tx_keys.secret_key, sp.derivation))
-		return false;
-	Hash message_hash = crypto::cn_fast_hash(sp.message.data(), sp.message.size());
-	if (!crypto::generate_send_proof(tx_keys.public_key, tx_keys.secret_key, sp.address.view_public_key, sp.derivation,
-	        message_hash, sp.signature))
-		return false;
+	SendproofAmethyst sp;
+	sp.version          = m_currency.amethyst_transaction_version;
+	sp.message          = message;
+	sp.transaction_hash = tid;
 	Amount total_amount = 0;
-	size_t key_index    = 0;
-	uint32_t out_index  = 0;
-	for (const auto &output : tx.outputs) {
-		if (output.target.type() == typeid(KeyOutput)) {
-			const KeyOutput &key_output = boost::get<KeyOutput>(output.target);
-			PublicKey spend_key;
-			if (underive_public_key(sp.derivation, key_index, key_output.key, spend_key) &&
-			    spend_key == sp.address.spend_public_key) {
-				total_amount += output.amount;
-			}
-			++key_index;
-		}
-		++out_index;
+	for (size_t out_index = 0; out_index != tx.outputs.size(); ++out_index) {
+		const auto &output = tx.outputs.at(out_index);
+		if (output.type() != typeid(OutputKey))
+			continue;
+		const auto &key_output = boost::get<OutputKey>(output);
+		Hash output_seed       = m_wallet.generate_output_seed(tx_inputs_hash, out_index);
+		PublicKey output_shared_secret;
+		// Message outputs are always amethyst
+		OutputKey should_be_output = TransactionBuilder::create_output(
+		    true, address, SecretKey{}, tx_inputs_hash, out_index, output_seed, &output_shared_secret);
+		if (should_be_output.public_key != key_output.public_key ||
+		    should_be_output.encrypted_secret != key_output.encrypted_secret ||
+		    should_be_output.encrypted_address_type != key_output.encrypted_address_type)
+			continue;  // output to different address or crypto protocol violated
+		sp.elements.push_back(SendproofAmethyst::Element{out_index, output_seed});
+		total_amount += key_output.amount;
 	}
-	sp.amount = total_amount;
-	return total_amount != 0;
+	if (reveal_secret_message) {
+		auto encrypted_messages = extra::get_encrypted_messages(tx.extra);
+		for (size_t m_index = 0; m_index != encrypted_messages.size(); ++m_index) {
+			const auto &em                 = encrypted_messages.at(m_index);
+			const size_t fake_output_index = tx.outputs.size() + m_index;
+			Hash output_seed               = m_wallet.generate_output_seed(tx_inputs_hash, fake_output_index);
+			PublicKey output_shared_secret;
+			OutputKey should_be_output = TransactionBuilder::create_output(
+			    true, address, SecretKey{}, tx_inputs_hash, fake_output_index, output_seed, &output_shared_secret);
+			if (should_be_output.public_key != em.output.public_key ||
+			    should_be_output.encrypted_secret != em.output.encrypted_secret ||
+			    should_be_output.encrypted_address_type != em.output.encrypted_address_type)
+				continue;  // output to different address or crypto protocol violated
+			sp.elements.push_back(SendproofAmethyst::Element{fake_output_index, output_seed});
+		}
+	}
+	if (sp.elements.empty())
+		throw std::runtime_error("No outputs to this address in transaction");
+	const auto proof_body = seria::to_binary(sp);
+	//	std::cout << "Proof body: " << common::to_hex(proof_body) << std::endl;
+	const auto proof_prefix_hash = crypto::cn_fast_hash(proof_body);
+	//	std::cout << "Proof hash: " << proof_prefix_hash << std::endl;
+	if (tx.inputs.empty() || tx.inputs.at(0).type() != typeid(InputKey) || mixed_outputs.empty())
+		throw std::runtime_error("Node returned non-matching transaction. Please update node to the latest version.");
+	const InputKey &in = boost::get<InputKey>(tx.inputs.at(0));
+	if (in.output_indexes.size() != mixed_outputs.at(0).size())
+		throw std::runtime_error("Node returned non-matching first input. Please update node to the latest version.");
+	HeightGi heamgi;
+	if (!read_by_keyimage(in.key_image, &heamgi))
+		throw std::runtime_error("Keyimage not in index. Wallet cache corrupted.");
+
+	TransactionPrefix other_tx;
+	api::Transaction other_atx;
+	if (!get_transaction(heamgi.transaction_hash, &other_tx, &other_atx) ||
+	    heamgi.index_in_transaction >= other_tx.outputs.size())
+		throw std::runtime_error("Transaction not in index. Wallet cache corrupted.");
+	const auto &key_output = boost::get<OutputKey>(other_tx.outputs.at(heamgi.index_in_transaction));
+	Hash other_inputs_hash = get_transaction_inputs_hash(other_tx);
+	std::vector<std::vector<PublicKey>> all_output_keys(1);
+	size_t sec_index = mixed_outputs.at(0).size();
+	for (size_t i = 0; i != mixed_outputs.at(0).size(); ++i) {
+		all_output_keys.at(0).push_back(mixed_outputs.at(0).at(i).public_key);
+		if (mixed_outputs.at(0).at(i).public_key == key_output.public_key) {
+			// TODO - compare other properties
+			sec_index = i;
+			// We do not break, we need to fill all_output_keys
+		}
+	}
+	if (sec_index == mixed_outputs.at(0).size())
+		throw std::runtime_error("Could not detect our mix-in. Wallet cache corrupted.");
+
+	KeyDerivation other_kd = crypto::generate_key_derivation(other_atx.public_key, m_wallet.get_view_secret_key());
+	size_t record_index    = 0;
+	SecretKey output_secret_key_s;
+	SecretKey output_secret_key_a;
+	PublicKey output_shared_secret;
+	if (!m_wallet.prepare_input_for_spend(other_tx.version, other_kd, other_inputs_hash, heamgi.index_in_transaction,
+	        key_output, &output_shared_secret, &output_secret_key_s, &output_secret_key_a, &record_index)) {
+		throw json_rpc::Error(json_rpc::INTERNAL_ERROR, "No keys in wallet to sign sendproof");
+	}
+	auto output_secret_hash_arg =
+	    crypto::get_output_secret_hash_arg(output_shared_secret, other_inputs_hash, heamgi.index_in_transaction);
+
+	std::vector<SecretKey> all_secret_keys_s{output_secret_key_s};
+	std::vector<SecretKey> all_secret_keys_a{output_secret_key_a};
+	std::vector<size_t> all_sec_indexes{sec_index};
+	std::vector<KeyImage> all_keyimages{in.key_image};
+	std::vector<BinaryArray> output_secret_hash_args{output_secret_hash_arg};
+	std::vector<size_t> address_indexes{record_index};
+
+	RingSignatureAmethyst rsa;
+	if (m_wallet.get_hw()) {
+		if (proof_body.empty())  // Remove after investigation
+			throw std::runtime_error("Proof body empty. Wallet cache corrupted.");
+		BinaryArray body_minus_guard(proof_body.begin() + 1, proof_body.end());
+		m_wallet.get_hw()->proof_start(body_minus_guard);
+		rsa = m_wallet.get_hw()->generate_ring_signature_amethyst(proof_prefix_hash, output_secret_hash_args,
+		    address_indexes, all_keyimages, all_output_keys, all_sec_indexes);
+	} else {
+		rsa = generate_ring_signature_amethyst(
+		    proof_prefix_hash, all_keyimages, all_output_keys, all_secret_keys_s, all_secret_keys_a, all_sec_indexes);
+	}
+
+	invariant(crypto::check_ring_signature_amethyst(proof_prefix_hash, all_keyimages, all_output_keys, rsa), "");
+	TransactionPrefix fake_prefix;
+	fake_prefix.version = tx.version;
+	fake_prefix.inputs.push_back(in);
+	BinaryArray sig_body = seria::to_binary(rsa, fake_prefix);
+	//	std::cout << "Sig body: " << common::to_hex(sig_body) << std::endl;
+
+	BinaryArray total_body = proof_body;
+	common::append(total_body, sig_body);
+
+	return common::base58::encode_addr(m_currency.sendproof_base58_prefix, total_body);
 }
 
 api::Block WalletState::api_get_pool_as_history(const std::string &address) const {
-	// TODO - filter by address?
+	// TODO - faster filter by address
 	api::Block current_block;
 	current_block.header.height = get_tip_height() + 1;
-	for (auto &&hit : m_memory_state.get_transactions()) {
-		current_block.transactions.push_back(hit.second.second);
-		current_block.transactions.back().block_height = get_tip_height() + 1;
+	for (const auto &hit : m_memory_state.get_transactions()) {
+		auto tx         = hit.second.atx;
+		tx.block_height = get_tip_height() + 1;
+		if (tx.transfers.empty())  // We also have to keep not ours transaction in pool
+			continue;
+		if (!address.empty()) {
+			bool address_found = false;
+			for (const auto &tr : tx.transfers)
+				if (tr.address == address) {
+					address_found = true;
+					break;
+				}
+			if (!address_found)
+				continue;
+		}
+		current_block.transactions.push_back(std::move(tx));
 	}
 	return current_block;
-}
-
-std::map<std::pair<Amount, uint32_t>, api::Output> WalletState::api_get_unlocked_outputs(const std::string &address,
-    Height from_height,
-    Height to_height) const {
-	std::map<std::pair<Amount, uint32_t>, api::Output> locked;
-	if (m_tip_height + 1 == m_tail_height)
-		return locked;
-	if (from_height >= to_height || from_height > m_tip_height || to_height <= m_tail_height)
-		return locked;
-	read_unlock_index(locked, UNLOCK_BLOCK_PREFIX, from_height, to_height);
-	if (from_height <= m_tip_height) {
-		Timestamp sta = from_height < m_tail_height ? 0 : read_chain(from_height).timestamp_unlock;
-		Timestamp fin =
-		    to_height > m_tip_height ? std::numeric_limits<Timestamp>::max() : read_chain(to_height).timestamp_unlock;
-		read_unlock_index(locked, UNLOCK_TIME_PREFIX, sta, fin);
-	}
-	return locked;
-}
-
-api::Balance WalletState::get_balance(const std::string &address, Height height) const {
-	auto bakey = BALANCE_PREFIX;
-	if (!address.empty())
-		bakey = ADDRESS_BALANCE_PREFIX + address;
-	BinaryArray ba;
-	api::Balance balance;
-	if (m_db.get(bakey, ba))
-		seria::from_binary(balance, ba);
-	Height from_height = height;
-	Height to_height   = get_tip_height();
-	auto blocks        = api_get_transfers(address, from_height, to_height, true);
-	for (auto &&hh : blocks) {
-		for (auto &&tx : hh.transactions) {
-			if (tx.unlock_time != 0)
-				continue;
-			for (auto &&tt : tx.transfers) {
-				if (!tt.ours || (!address.empty() && address != tt.address))
-					continue;
-				if (tt.amount > 0)
-					for (auto &&ou : tt.outputs) {
-						if (is_unspent(ou) && !m_memory_state.is_spent(ou))
-							combine_balance(balance, ou, 1, -1);
-					}
-			}
-		}
-	}
-	auto unlocked_outputs = api_get_unlocked_outputs(address, height, m_tip_height);
-	for (auto &&ou : unlocked_outputs) {  // TODO - correct behaviour of
-		                                  // memory-pool-spent unlocked outputs
-		if (!m_memory_state.is_spent(ou.second))
-			combine_balance(balance, ou.second, 1, -1);
-	}
-	for (auto &&hit : m_memory_state.get_transactions()) {
-		const api::Transaction &tx = hit.second.second;
-		if (tx.unlock_time != 0)
-			continue;
-		for (auto &&tt : tx.transfers) {
-			if (!tt.ours || (!address.empty() && address != tt.address))
-				continue;
-			if (tt.amount > 0)
-				for (auto &&ou : tt.outputs)
-					combine_balance(balance, ou, 1, 0);
-			else
-				for (auto &&ou : tt.outputs)
-					combine_balance(balance, ou, 0, -1);
-		}
-	}
-	return balance;
 }

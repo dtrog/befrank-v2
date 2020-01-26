@@ -3,87 +3,119 @@
 
 #pragma once
 
-#include "Node.hpp"
 #include "WalletSync.hpp"
-#include "http/Server.hpp"
 
-namespace bytecoin {
+namespace http {
+class Server;
+class Client;
+}  // namespace http
+namespace platform {
+class ExclusiveLock;
+}  // namespace platform
+namespace cn {
+class Node;
 
-class WalletNode : public WalletSync {
+class WalletNode {
 public:
-	explicit WalletNode(Node *inproc_node, logging::ILogger &, const Config &, WalletState &);
+	explicit WalletNode(logging::ILogger &, WalletState &);
+	explicit WalletNode(const Config &config, const Currency &currency, logging::ILogger &);
+	virtual ~WalletNode();
 
-	typedef std::function<bool(
-	    WalletNode *, http::Client *, http::RequestData &&, json_rpc::Request &&, json_rpc::Response &)>
+	typedef std::function<bool(WalletNode *, http::Client *, http::RequestBody &&, json_rpc::Request &&, std::string &)>
 	    JSONRPCHandlerFunction;
 
-	// New protocol (json_rpc3)
-	bool handle_get_status3(http::Client *, http::RequestData &&, json_rpc::Request &&,
-	    api::walletd::GetStatus::Request &&, api::walletd::GetStatus::Response &);
-	bool handle_get_addresses3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_get_status(http::Client *, http::RequestBody &&, json_rpc::Request &&, api::walletd::GetStatus::Request &&,
+	    api::walletd::GetStatus::Response &);
+	bool on_get_addresses(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::GetAddresses::Request &&, api::walletd::GetAddresses::Response &);
-	bool handle_create_address_list3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_get_wallet_info(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::GetWalletInfo::Request &&, api::walletd::GetWalletInfo::Response &);
+	bool on_get_wallet_records(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::GetWalletRecords::Request &&, api::walletd::GetWalletRecords::Response &);
+	bool on_set_label(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::SetAddressLabel::Request &&, api::walletd::SetAddressLabel::Response &);
+	bool on_create_addresses(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::CreateAddresses::Request &&, api::walletd::CreateAddresses::Response &);
-	bool handle_get_view_key3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_get_view_key(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::GetViewKeyPair::Request &&, api::walletd::GetViewKeyPair::Response &);
-	bool handle_get_unspent3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_get_unspent(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::GetUnspents::Request &&, api::walletd::GetUnspents::Response &);
-	bool handle_get_balance3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_get_balance(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::GetBalance::Request &&, api::walletd::GetBalance::Response &);
-	bool handle_get_transfers3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_get_transfers(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::GetTransfers::Request &&, api::walletd::GetTransfers::Response &);
-	bool handle_create_transaction3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_create_transaction(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::CreateTransaction::Request &&, api::walletd::CreateTransaction::Response &);
-	bool handle_create_send_proof3(http::Client *, http::RequestData &&, json_rpc::Request &&,
-	    api::walletd::CreateSendProof::Request &&, api::walletd::CreateSendProof::Response &);
-	bool handle_send_transaction3(http::Client *, http::RequestData &&, json_rpc::Request &&,
-	    api::bytecoind::SendTransaction::Request &&,
-	    api::bytecoind::SendTransaction::Response &);  // We lock spent outputs until next pool sync
-	bool handle_get_transaction3(http::Client *, http::RequestData &&, json_rpc::Request &&,
+	bool on_create_sendproof(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::CreateSendproof::Request &&, api::walletd::CreateSendproof::Response &);
+	bool on_send_transaction(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::cnd::SendTransaction::Request &&,
+	    api::cnd::SendTransaction::Response &);  // We lock spent outputs until next pool sync
+	bool on_get_transaction(http::Client *, http::RequestBody &&, json_rpc::Request &&,
 	    api::walletd::GetTransaction::Request &&, api::walletd::GetTransaction::Response &);
 
-private:
-	Node *m_inproc_node;
+	virtual bool on_ext_create_wallet(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::ExtCreateWallet::Request &&, api::walletd::ExtCreateWallet::Response &);
+	virtual bool on_ext_open_wallet(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::ExtOpenWallet::Request &&, api::walletd::ExtOpenWallet::Response &);
+	virtual bool on_ext_set_password(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::ExtSetPassword::Request &&, api::walletd::ExtSetPassword::Response &);
+	virtual bool on_ext_close_wallet(http::Client *, http::RequestBody &&, json_rpc::Request &&,
+	    api::walletd::ExtCloseWallet::Request &&, api::walletd::ExtCloseWallet::Response &);
+
+	typedef std::unordered_map<std::string, JSONRPCHandlerFunction> HandlersMap;
+	static const HandlersMap m_jsonrpc_handlers;
+
+protected:
+	logging::LoggerRef m_log;
+	const Config &m_config;
+	const Currency &m_currency;
 
 	std::unique_ptr<http::Server> m_api;
 
+	std::unique_ptr<WalletSync> m_wallet_sync;
+
 	struct WaitingClient {
 		http::Client *original_who = nullptr;
-		http::RequestData request;
-		http::RequestData original_request;
-		json_rpc::OptionalJsonValue original_jsonrpc_id;
-		std::function<void(const WaitingClient &wc, http::ResponseData &&resp)> fun;
+		http::RequestBody request;
+		http::RequestBody original_request;
+		json_rpc::Request original_json_request;
+		std::function<void(const WaitingClient &wc, http::ResponseBody &&resp)> fun;
 		std::function<void(const WaitingClient &wc, std::string)> err_fun;
 	};
 	std::deque<WaitingClient> m_waiting_command_requests;
-	void add_waiting_command(http::Client *who, http::RequestData &&original_request,
-	    const json_rpc::OptionalJsonValue &original_rpc_id, http::RequestData &&request,
-	    std::function<void(const WaitingClient &wc, http::ResponseData &&resp)> fun,
-	    std::function<void(const WaitingClient &wc, std::string)> err_fun);
+	http::Agent m_commands_agent;
+	std::unique_ptr<http::Request> m_command_request;
+
+	void add_waiting_command(http::Client *who, http::RequestBody &&original_request,
+	    json_rpc::Request &&original_json_request, http::RequestBody &&request,
+	    std::function<void(const WaitingClient &wc, http::ResponseBody &&resp)> &&fun,
+	    std::function<void(const WaitingClient &wc, std::string)> &&err_fun);
 	void send_next_waiting_command();
-	void process_waiting_command_response(http::ResponseData &&resp);
+	void process_waiting_command_response(http::ResponseBody &&resp);
 	void process_waiting_command_error(std::string err);
 
 	struct LongPollClient {
 		http::Client *original_who = nullptr;
-		http::RequestData original_request;
-		json_rpc::OptionalJsonValue original_jsonrpc_id;
-		bytecoin::api::walletd::GetStatus::Request original_get_status;
+		http::RequestBody original_request;
+		json_rpc::Request original_json_request;
+		api::walletd::GetStatus::Request original_get_status;
 	};
 	std::list<LongPollClient> m_long_poll_http_clients;
 	void advance_long_poll();
 
-	typedef std::unordered_map<std::string, JSONRPCHandlerFunction> HandlersMap;
-	static const HandlersMap m_jsonrpc3_handlers;
+	api::walletd::GetStatus::Response create_status_response() const;
 
-	api::walletd::GetStatus::Response create_status_response3() const;
+	bool on_api_http_request(http::Client *, http::RequestBody &&, http::ResponseBody &);
+	virtual void on_api_http_disconnect(http::Client *);
 
-	bool on_api_http_request(http::Client *, http::RequestData &&, http::ResponseData &);
-	void on_api_http_disconnect(http::Client *);
+	bool on_json_rpc(http::Client *, http::RequestBody &&, http::ResponseBody &, bool &method_found);
+	void check_address_in_wallet_or_throw(const std::string &addr) const;
 
-	bool process_json_rpc_request(
-	    const HandlersMap &, http::Client *, http::RequestData &&, http::ResponseData &, bool &method_found);
-	void check_address_in_wallet_or_throw(const std::string & addr)const;
+	WalletState &get_wallet_state() { return m_wallet_sync->get_wallet_state(); }
+	const WalletState &get_wallet_state() const { return m_wallet_sync->get_wallet_state(); }
+
+	void check_wallet_open();
 };
 
-}  // namespace bytecoin
+}  // namespace cn

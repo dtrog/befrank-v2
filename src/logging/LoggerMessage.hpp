@@ -21,7 +21,7 @@ private:
 	ILogger &logger;
 	const std::string category;
 	Level log_level;
-	boost::posix_time::ptime timestamp;
+	std::time_t timestamp;
 };
 
 class LoggerRef {
@@ -35,4 +35,4 @@ private:
 	ILogger *logger;
 	std::string category;
 };
-}
+}  // namespace logging

@@ -3,120 +3,72 @@
 
 #pragma once
 
-#include <boost/variant.hpp>
-#include <vector>
-
 #include "CryptoNote.hpp"
-#include "seria/ISeria.hpp"
 
-namespace bytecoin {
+namespace cn { namespace extra {
 
-enum { TX_EXTRA_PADDING_MAX_COUNT = 255, TX_EXTRA_NONCE_MAX_COUNT = 255, TX_EXTRA_NONCE_PAYMENT_ID = 0x00 };
-
-struct TransactionExtraPadding {
+struct Padding {
 	size_t size = 0;
 	enum { tag = 0x00 };
+	// We removed MAX_COUNT, when padding encountered, remaining bytes are padding
 };
 
-struct TransactionExtraPublicKey {
-	crypto::PublicKey public_key;
+struct TransactionPublicKey {
+	PublicKey public_key;
 	enum { tag = 0x01 };
 };
 
-struct TransactionExtraNonce {
+struct Nonce {
 	BinaryArray nonce;
-	enum { tag = 0x02 };
+	enum { tag = 0x02, MAX_COUNT = 127, PAYMENT_ID = 0x00 };
+	// We limit MAX_COUNT so that single byte (former) is equal to varint encoding (now)
 };
 
-struct TransactionExtraMergeMiningTag {
+struct MergeMiningTag {
 	size_t depth = 0;
-	crypto::Hash merkle_root;
+	Hash merkle_root;
 	enum { tag = 0x03 };
 };
 
-// tx_extra_field format, except tx_extra_padding and tx_extra_pub_key:
-//   varint tag;
-//   varint size;
-//   varint data[];
-typedef boost::variant<TransactionExtraPadding, TransactionExtraPublicKey, TransactionExtraNonce,
-    TransactionExtraMergeMiningTag>
-    TransactionExtraField;
-
-bool parse_transaction_extra(const BinaryArray &tx_extra, std::vector<TransactionExtraField> &tx_extra_fields);
-bool write_transaction_extra(BinaryArray &tx_extra, const std::vector<TransactionExtraField> &tx_extra_fields);
-
-crypto::PublicKey get_transaction_public_key_from_extra(const BinaryArray &tx_extra);
-bool add_transaction_public_key_to_extra(BinaryArray &tx_extra, const crypto::PublicKey &tx_pub_key);
-bool add_extra_nonce_to_transaction_extra(BinaryArray &tx_extra, const BinaryArray &extra_nonce);
-void set_payment_id_to_transaction_extra_nonce(BinaryArray &extra_nonce, const crypto::Hash &payment_id);
-bool get_payment_id_from_transaction_extra_nonce(const BinaryArray &extra_nonce, crypto::Hash &payment_id);
-bool append_merge_mining_tag_to_extra(BinaryArray &tx_extra, const TransactionExtraMergeMiningTag &mm_tag);
-bool get_merge_mining_tag_from_extra(const BinaryArray &tx_extra, TransactionExtraMergeMiningTag &mm_tag);
-
-bool get_payment_id_from_tx_extra(const BinaryArray &extra, crypto::Hash &payment_id);
-
-class TransactionExtra {
-public:
-	TransactionExtra() {}
-	TransactionExtra(const BinaryArray &extra) { parse(extra); }
-	bool parse(const BinaryArray &extra) {
-		m_fields.clear();
-		return bytecoin::parse_transaction_extra(extra, m_fields);
-	}
-	template<typename T>
-	bool get(T &value) const {
-		auto it = find(typeid(T));
-		if (it == m_fields.end()) {
-			return false;
-		}
-		value = boost::get<T>(*it);
-		return true;
-	}
-	template<typename T>
-	void set(const T &value) {
-		auto it = find(typeid(T));
-		if (it != m_fields.end()) {
-			*it = value;
-		} else {
-			m_fields.push_back(value);
-		}
-	}
-
-	template<typename T>
-	void append(const T &value) {
-		m_fields.push_back(value);
-	}
-
-	bool get_public_key(crypto::PublicKey &pk) const {
-		bytecoin::TransactionExtraPublicKey extra_pk;
-		if (!get(extra_pk)) {
-			return false;
-		}
-		pk = extra_pk.public_key;
-		return true;
-	}
-
-	BinaryArray serialize() const {
-		BinaryArray extra;
-		write_transaction_extra(extra, m_fields);
-		return extra;
-	}
-
-private:
-	std::vector<bytecoin::TransactionExtraField>::const_iterator find(const std::type_info &t) const {
-		return std::find_if(
-		    m_fields.begin(), m_fields.end(), [&t](const bytecoin::TransactionExtraField &f) { return t == f.type(); });
-	}
-	std::vector<bytecoin::TransactionExtraField>::iterator find(const std::type_info &t) {
-		return std::find_if(
-		    m_fields.begin(), m_fields.end(), [&t](const bytecoin::TransactionExtraField &f) { return t == f.type(); });
-	}
-
-	std::vector<bytecoin::TransactionExtraField> m_fields;
+struct BlockCapacityVote {
+	size_t block_capacity = 0;
+	enum { tag = 0x04 };
 };
-}
+
+struct EncryptedMessage {
+	OutputKey output;             // Always amethyst type, amount is not serialized
+	common::BinaryArray message;  // No CRC needed because we run normal coin detection algorithm
+	enum { tag = 0x05 };
+};
+// tx_extra_field format, except Padding, TransactionPublicKey:
+//   varint tag;
+//   varint size | byte size
+//   varint data[];
+
+bool is_valid(const BinaryArray &tx_extra);
+
+void add_transaction_public_key(BinaryArray &tx_extra, const PublicKey &tx_pub_key);
+bool get_transaction_public_key(const BinaryArray &tx_extra, PublicKey *tx_pub_key);
+
+void add_nonce(BinaryArray &tx_extra, const BinaryArray &extra_nonce);
+void add_merge_mining_tag(BinaryArray &tx_extra, const MergeMiningTag &field);
+bool get_merge_mining_tag(const BinaryArray &tx_extra, MergeMiningTag *field);
+
+void add_block_capacity_vote(BinaryArray &tx_extra, size_t block_capacity);
+bool get_block_capacity_vote(const BinaryArray &tx_extra, size_t *block_capacity);
+
+void add_payment_id(BinaryArray &tx_extra, const Hash &payment_id);
+bool get_payment_id(const BinaryArray &tx_extra, Hash *payment_id);
+
+void add_encrypted_message(BinaryArray &tx_extra, const EncryptedMessage &message);
+size_t get_encrypted_message_size(size_t size);
+std::vector<EncryptedMessage> get_encrypted_messages(const BinaryArray &tx_extra);
+
+}}  // namespace cn::extra
 
 namespace seria {
 class ISeria;
-void ser(bytecoin::TransactionExtraMergeMiningTag &v, ISeria &s);
-}
+void ser_members(cn::extra::MergeMiningTag &v, ISeria &s);
+void ser_members(cn::extra::BlockCapacityVote &v, ISeria &s);
+void ser_members(cn::extra::EncryptedMessage &v, ISeria &s);
+}  // namespace seria

@@ -2,94 +2,91 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include "Ipv4Address.hpp"
-#include <boost/lexical_cast.hpp>
-#include <stdexcept>
+#include "Math.hpp"
 #include "StringTools.hpp"
+#include "exception.hpp"
 
 namespace common {
 
-std::string ip_address_to_string(uint32_t ip) {
-	uint8_t bytes[4]{};
-	bytes[0] = ip & 0xFF;
-	bytes[1] = (ip >> 8) & 0xFF;
-	bytes[2] = (ip >> 16) & 0xFF;
-	bytes[3] = (ip >> 24) & 0xFF;
+std::string NetworkAddress::to_string() const { return common::ip_address_and_port_to_string(ip, port); }
 
+std::string ip_address_to_string(const BinaryArray &ip) {
+	if (ip.size() != 4)
+		return "?.?.?.?";
 	char buf[16]{};
-	sprintf(buf, "%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3]);
+	sprintf(buf, "%u.%u.%u.%u", ip.data()[0], ip.data()[1], ip.data()[2], ip.data()[3]);
 
 	return std::string(buf);
 }
 
-std::string ip_address_and_port_to_string(uint32_t ip, uint32_t port) {
-	uint8_t bytes[4]{};
-	bytes[0] = ip & 0xFF;
-	bytes[1] = (ip >> 8) & 0xFF;
-	bytes[2] = (ip >> 16) & 0xFF;
-	bytes[3] = (ip >> 24) & 0xFF;
+uint32_t ip_address_to_legacy(const BinaryArray &ip) {
+	if (ip.size() != 4)
+		return 0;
+	return (static_cast<uint32_t>(ip.data()[0])) | (static_cast<uint32_t>(ip.data()[1]) << 8) |
+	       (static_cast<uint32_t>(ip.data()[2]) << 16) | (static_cast<uint32_t>(ip.data()[3]) << 24);
+}
+BinaryArray ip_address_from_legacy(uint32_t ip) {
+	return BinaryArray{static_cast<uint8_t>(ip), static_cast<uint8_t>(ip >> 8), static_cast<uint8_t>(ip >> 16),
+	    static_cast<uint8_t>(ip >> 24)};
+}
 
+std::string ip_address_and_port_to_string(const BinaryArray &ip, uint16_t port) {
+	if (ip.size() != 4)
+		return "?.?.?.?";
 	char buf[24]{};
-	sprintf(buf, "%d.%d.%d.%d:%d", bytes[0], bytes[1], bytes[2], bytes[3], port);
+	sprintf(buf, "%u.%u.%u.%u:%u", ip.data()[0], ip.data()[1], ip.data()[2], ip.data()[3], port);
 
 	return std::string(buf);
 }
 
-bool parse_ip_address(const std::string &addr, uint32_t *ip) {
-	uint32_t v[4]{};
-
-	if (sscanf(addr.c_str(), "%u.%u.%u.%u", &v[0], &v[1], &v[2], &v[3]) != 4) {
-		return false;
+BinaryArray parse_ip_address(const std::string &addr) {
+	std::string v[4];
+	if (!common::split_string(addr, ".", v[0], v[1], v[2], v[3]))
+		throw std::runtime_error("IP Address must be in a.b.c.d format");
+	try {
+		return BinaryArray{integer_cast<uint8_t>(v[0]), integer_cast<uint8_t>(v[1]), integer_cast<uint8_t>(v[2]),
+		    integer_cast<uint8_t>(v[3])};
+	} catch (const std::exception &) {
+		std::throw_with_nested(std::runtime_error("IP Address component must be in range 0.255"));
 	}
+}
 
-	for (int i = 0; i < 4; ++i) {
-		if (v[i] > 0xff) {
-			return false;
-		}
+bool parse_ip_address(const std::string &addr, BinaryArray *ip) {
+	try {
+		*ip = parse_ip_address(addr);
+		return true;
+	} catch (const std::exception &) {
 	}
-
-	*ip = (v[3] << 24) | (v[2] << 16) | (v[1] << 8) | v[0];
-	return true;
+	return false;
 }
 
-bool parse_ip_address_and_port(const std::string &addr, uint32_t *ip, uint32_t *port) {
-	uint32_t v[4]{};
-	uint32_t local_port = 0;
-
-	if (sscanf(addr.c_str(), "%u.%u.%u.%u:%u", &v[0], &v[1], &v[2], &v[3], &local_port) != 5) {
-		return false;
-	}
-
-	for (int i = 0; i < 4; ++i) {
-		if (v[i] > 0xff) {
-			return false;
-		}
-	}
-
-	*ip = (v[3] << 24) | (v[2] << 16) | (v[1] << 8) | v[0];
-	if (local_port > 65535)
-		return false;
-	*port = local_port;
-	return true;
+// TODO - add IPv6 support
+void parse_ip_address_and_port(const std::string &addr, BinaryArray *ip, uint16_t *port) {
+	std::string sip;
+	std::string sport;
+	if (!common::split_string(addr, ":", sip, sport))
+		throw std::runtime_error("Address must be in ip:port format");
+	*ip = parse_ip_address(sip);
+	ewrap(*port = integer_cast<uint16_t>(sport), std::runtime_error("Port must be in range 0..65535"));
 }
 
-bool parse_ip_address_and_port(const std::string &addr, std::string *ip, uint16_t *port) {
-	uint32_t sip = 0, sport = 0;
-	if (!parse_ip_address_and_port(addr, &sip, &sport))
-		return false;
-	*port = static_cast<uint16_t>(sport);
-	*ip   = ip_address_to_string(sip);
-	return true;
+void parse_ip_address_and_port(const std::string &addr, std::string *ip, uint16_t *port) {
+	BinaryArray sip;
+	parse_ip_address_and_port(addr, &sip, port);
+	*ip = ip_address_to_string(sip);
 }
 
-bool is_ip_address_loopback(uint32_t ip) { return (ip & 0xff000000) == (127 << 24); }
-
-bool is_ip_address_private(uint32_t ip) {
-	return
-	    // 10.0.0.0/8
-	    (ip & 0xff000000) == (10u << 24) ||
-	    // 172.16.0.0/12
-	    (ip & 0xfff00000) == ((172u << 24) | (16u << 16)) ||
-	    // 192.168.0.0/16
-	    (ip & 0xffff0000) == ((192u << 24) | (168u << 16));
+int get_private_network_prefix(const BinaryArray &ip) {
+	if (ip.size() != 4)
+		return 6;
+	if (ip.data()[0] == 127)  // 127.x.x.x
+		return 127;
+	if (ip.data()[0] == 10)  // 10.0.0.0/8
+		return 10;
+	if (ip.data()[0] == 192 && ip.data()[1] == 168)  // 192.168.0.0/16
+		return 192;
+	if (ip.data()[0] == 172 && (ip.data()[1] & 0xf0) == 16)  // 172.16.0.0/12
+		return 172;
+	return 0;
 }
-}
+}  // namespace common

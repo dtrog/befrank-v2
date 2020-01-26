@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <string>
 #include <type_traits>
@@ -28,17 +29,15 @@ public:
 	enum Type {
 		ARRAY,
 		BOOL,
-		SIGNED_INTEGER,
-		UNSIGNED_INTEGER,
+		NUMBER,
 		NIL,
 		OBJECT,
-		DOUBLE,
 		STRING
 	};  // We preserve semantic of very large 64-bit values by splitting into signed/unsigned
 
 	JsonValue();
 	JsonValue(const JsonValue &other);
-	JsonValue(JsonValue &&other);
+	JsonValue(JsonValue &&other) noexcept;
 	JsonValue(Type value_type);
 	JsonValue(const Array &value);
 	JsonValue(Array &&value);
@@ -60,16 +59,18 @@ public:
 	~JsonValue();
 
 	JsonValue &operator=(const JsonValue &other);
-	JsonValue &operator=(JsonValue &&other);
+	JsonValue &operator=(JsonValue &&other) noexcept;
 	JsonValue &operator=(const Array &value);
 	JsonValue &operator=(Array &&value);
 	JsonValue &operator=(Bool value);
 	JsonValue &operator=(Integer value);
 	JsonValue &operator=(Unsigned value);
+	JsonValue &operator=(Double value);
+	JsonValue &set_number(const std::string &number);  // for bigints, etc
+	JsonValue &set_number(std::string &&number);       // for bigints, etc
 	JsonValue &operator=(std::nullptr_t value);
 	JsonValue &operator=(const Object &value);
 	JsonValue &operator=(Object &&value);
-	JsonValue &operator=(Double value);
 	JsonValue &operator=(const String &value);
 	JsonValue &operator=(String &&value);
 	template<size_t size>
@@ -86,10 +87,9 @@ public:
 
 	bool is_array() const { return type == ARRAY; }
 	bool is_bool() const { return type == BOOL; }
-	bool is_integer() const { return type == SIGNED_INTEGER || type == UNSIGNED_INTEGER; }
+	bool is_number() const { return type == NUMBER; }
 	bool is_nil() const { return type == NIL; }
 	bool is_object() const { return type == OBJECT; }
-	bool is_double() const { return type == DOUBLE; }
 	bool is_string() const { return type == STRING; }
 
 	//	Type get_type() const { return type; }
@@ -98,9 +98,11 @@ public:
 	Bool get_bool() const;
 	Integer get_integer() const;
 	Unsigned get_unsigned() const;
+	Double get_double() const;
+	std::string &get_number();
+	const std::string &get_number() const;
 	Object &get_object();
 	const Object &get_object() const;
-	Double get_double() const;
 	String &get_string();
 	const String &get_string() const;
 
@@ -126,31 +128,49 @@ public:
 	static JsonValue from_string(const std::string &source);
 	std::string to_string() const;
 
-	// those operators should no be used because they do not check for correct end of object (example - extra comma
-	// after json object)
 	friend std::ostream &operator<<(std::ostream &out, const JsonValue &json_value);
-	friend std::istream &operator>>(std::istream &in, JsonValue &json_value);
+
+	static std::string escape_string(const std::string &str);
 
 private:
 	Type type;
 	union {
 		typename std::aligned_storage<sizeof(Array), alignof(Array)>::type value_array;
 		Bool value_bool;
-		Integer value_integer;
-		Unsigned value_unsigned;
 		typename std::aligned_storage<sizeof(Object), alignof(Object)>::type value_object;
-		Double value_real;
 		typename std::aligned_storage<sizeof(std::string), alignof(std::string)>::type value_string;
+		// We reuse value_string for number
 	};
 
 	void destruct_value();
+	JsonValue &set_number_unchecked(const std::string &number);
+	JsonValue &set_number_unchecked(std::string &&number);
 
-	void read_array(std::istream &in);
-	void read_true(std::istream &in);
-	void read_false(std::istream &in);
-	void read_null(std::istream &in);
-	void read_number(std::istream &in, char c);
-	void read_object(std::istream &in);
-	void read_string(std::istream &in);
+	struct StreamContext {
+		std::istreambuf_iterator<char> it;
+		const std::istreambuf_iterator<char> end;
+		std::string mini_buf;  // relatively efficient char history buffer
+		size_t mini_pos       = 0;
+		bool prev_white_space = true;  // collapse whitespaces in mini_buf
+	public:
+		explicit StreamContext(std::istream &in);
+		char peek_char() const;
+		char read_char();
+		char read_non_ws_char();
+		char peek_non_ws_char();
+		std::string read_string_token();
+		void eat_all_whitespace();
+		void throw_error(const std::string &text);
+		void expect(char c, char should_be_c);
+	};
+	void read_json(size_t level, StreamContext &ctx);
+
+	void read_array(size_t level, StreamContext &ctx);
+	void read_true(StreamContext &ctx);
+	void read_false(StreamContext &ctx);
+	void read_null(StreamContext &ctx);
+	void read_number(StreamContext &ctx, char first_char);
+	void read_object(size_t level, StreamContext &ctx);
+	void read_string(StreamContext &ctx);
 };
-}
+}  // namespace common

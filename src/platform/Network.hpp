@@ -13,14 +13,71 @@
 #include "TargetConditionals.h"
 #endif
 
-#if defined(__ANDROID__)
+#ifdef __EMSCRIPTEN__
+namespace platform {
+class Timer : private common::Nocopy {
+public:
+	typedef std::function<void()> after_handler;
+
+	explicit Timer(after_handler &&a_handler);
+	~Timer();
+
+	void once(float after_seconds);  // cancels previous once first
+	bool is_set() const;
+	void cancel();
+
+private:
+	class Impl;
+	std::unique_ptr<Impl> impl;
+	after_handler a_handler;
+};
+
+}  // namespace platform
+#elif platform_USE_QT
+#include <QObject>
 #include <QTcpSocket>
 #include <QTimer>
+#include <atomic>
 
 namespace platform {
 class EventLoop {
+	//    Q_OBJECT
+	// public:
+	//	EventLoop();
+	//	~EventLoop();
+	//	static EventLoop *current() { return current_loop; }
+	//	static void cancel_current() {}
+	// private:
+	//	static thread_local EventLoop *current_loop;
+};
+class SafeMessage;
+// Nested classes cannot have slots
+class SafeMessageImpl : public QObject {
+	Q_OBJECT
 public:
-	static void cancel_current() {}
+	explicit SafeMessageImpl(SafeMessage *owner);
+	~SafeMessageImpl();
+	platform::SafeMessage *owner;
+	std::atomic<int> counter;
+
+	void close();
+public slots:
+	void handle_event();
+};
+class SafeMessage : private common::Nocopy {
+public:
+	typedef std::function<void()> after_handler;
+
+	explicit SafeMessage(after_handler &&a_handler);
+	~SafeMessage();
+
+	void fire();  // The only method to be called from other threads
+	void cancel();
+
+private:
+	friend class SafeMessageImpl;
+	std::unique_ptr<SafeMessageImpl> impl;
+	after_handler a_handler;
 };
 class Timer : private common::Nocopy {
 public:
@@ -30,6 +87,7 @@ public:
 	~Timer() { cancel(); }
 
 	void once(float after_seconds);  // cancels previous once first
+	bool is_set() const;
 	void cancel();
 
 private:
@@ -64,14 +122,14 @@ private:
 };
 class TCPAcceptor : private common::Nocopy {
 public:
+	class AddressInUse : public std::runtime_error {
+	public:
+		using std::runtime_error::runtime_error;
+	};
+
 	typedef std::function<void()> A_handler;
 
-	explicit TCPAcceptor(const std::string &addr,
-	    uint16_t port,
-	    A_handler a_handler,
-	    const std::string &ssl_pem_file             = std::string(),
-	    const std::string &ssl_certificate_password = std::string())
-	    : a_handler(a_handler) {}
+	explicit TCPAcceptor(const std::string &addr, uint16_t port, A_handler a_handler) : a_handler(a_handler) {}
 	~TCPAcceptor() {}
 
 	bool accept(TCPSocket &socket, std::string &accepted_addr) { return false; }
@@ -80,7 +138,7 @@ public:
 private:
 	A_handler a_handler;
 };
-}
+}  // namespace platform
 #elif TARGET_OS_IPHONE
 #include <CFNetwork/CFNetwork.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -89,15 +147,18 @@ namespace platform {
 class EventLoop {
 public:
 	static void cancel_current() {}
+	static EventLoop *current() { return nullptr; }
+	void wake(std::function<void()> &&a_handler) {}
 };
 class Timer : private common::Nocopy {
 public:
 	typedef std::function<void()> after_handler;
 
-	explicit Timer(after_handler a_handler) : a_handler(a_handler), impl(nullptr) {}
+	explicit Timer(after_handler &&a_handler) : a_handler(std::move(a_handler)), impl(nullptr) {}
 	~Timer() { cancel(); }
 
 	void once(float after_seconds);  // cancels previous once first
+	bool is_set() const;
 	void cancel();
 
 private:
@@ -112,7 +173,8 @@ public:
 	typedef std::function<void(bool can_read, bool can_write)> RW_handler;
 	typedef std::function<void(void)> D_handler;
 
-	explicit TCPSocket(RW_handler rw_handler, D_handler d_handler) : rw_handler(rw_handler), d_handler(d_handler) {}
+	explicit TCPSocket(RW_handler &&rw_handler, D_handler &&d_handler)
+	    : rw_handler(std::move(rw_handler)), d_handler(std::move(d_handler)) {}
 	virtual ~TCPSocket() { close(); }
 	void close();          // after close you are guaranteed that no handlers will be called
 	bool is_open() const;  // Connecting or connected
@@ -138,12 +200,8 @@ class TCPAcceptor : private common::Nocopy {
 public:
 	typedef std::function<void()> A_handler;
 
-	explicit TCPAcceptor(const std::string &addr,
-	    uint16_t port,
-	    A_handler a_handler,
-	    const std::string &ssl_pem_file             = std::string(),
-	    const std::string &ssl_certificate_password = std::string())
-	    : a_handler(a_handler) {}
+	explicit TCPAcceptor(const std::string &addr, uint16_t port, A_handler &&a_handler)
+	    : a_handler(std::move(a_handler)) {}
 	~TCPAcceptor() {}
 
 	bool accept(TCPSocket &socket, std::string &accepted_addr) { return false; }
@@ -152,7 +210,17 @@ public:
 private:
 	A_handler a_handler;
 };
-}
+class UDPMulticast : private common::Nocopy {
+public:
+	typedef std::function<void(const std::string &addr, const unsigned char *data, size_t size)> P_handler;
+	UDPMulticast(const std::string &addr, uint16_t port, P_handler &&p_handler) : p_handler(std::move(p_handler)) {}
+	~UDPMulticast() {}
+	static void send(const std::string &addr, uint16_t port, const void *data, size_t size) {}
+
+private:
+	P_handler p_handler;
+};
+}  // namespace platform
 #else
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -171,7 +239,7 @@ public:
 
 	void run();  // run until cancel
 	void cancel();
-	void wake();
+	void wake(std::function<void()> &&a_handler);
 
 	static void cancel_current() { current()->cancel(); }
 
@@ -181,15 +249,31 @@ private:
 	boost::asio::io_service &io_service;
 	static thread_local EventLoop *current_loop;
 };
+class SafeMessage : private common::Nocopy {
+public:
+	typedef std::function<void()> after_handler;
+
+	explicit SafeMessage(after_handler &&a_handler);
+	~SafeMessage();
+
+	void fire();  // The only method to be called from other threads
+	void cancel();
+
+private:
+	class Impl;
+	std::unique_ptr<Impl> impl;
+	after_handler a_handler;
+};
 
 class Timer : private common::Nocopy {
 public:
 	typedef std::function<void()> after_handler;
 
-	explicit Timer(after_handler a_handler) : a_handler(a_handler) {}
+	explicit Timer(after_handler &&a_handler) : a_handler(std::move(a_handler)) {}
 	~Timer() { cancel(); }
 
 	void once(float after_seconds);  // cancels previous once first
+	bool is_set() const;
 	void cancel();
 
 private:
@@ -204,8 +288,8 @@ public:
 	typedef std::function<void(bool can_read, bool can_write)> RW_handler;
 	typedef std::function<void(void)> D_handler;
 
-	explicit TCPSocket(RW_handler rw_handler, D_handler d_handler);
-	virtual ~TCPSocket();
+	explicit TCPSocket(RW_handler &&rw_handler, D_handler &&d_handler);
+	~TCPSocket() override;
 	void close();          // after close you are guaranteed that no handlers will be called
 	bool is_open() const;  // Connecting or connected
 	bool connect(const std::string &addr, uint16_t port);
@@ -228,9 +312,14 @@ private:
 class TCPAcceptor : private common::Nocopy {
 public:
 	typedef std::function<void()> A_handler;
+	class AddressInUse : public std::runtime_error {
+	public:
+		using std::runtime_error::runtime_error;
+	};
 
-	explicit TCPAcceptor(const std::string &addr, uint16_t port, A_handler a_handler,
-	    const std::string &ssl_pem_file = std::string(), const std::string &ssl_certificate_password = std::string());
+	static std::vector<std::string> local_addresses(bool ipv4, bool ipv6);
+
+	explicit TCPAcceptor(const std::string &addr, uint16_t port, A_handler &&a_handler);
 	~TCPAcceptor();
 
 	// if accept returns false, will fire accept_handler in future
@@ -245,5 +334,18 @@ private:
 	std::shared_ptr<Impl> impl;  // Owned by boost async machinery
 	A_handler a_handler;
 };
-}
+
+// Experimental zero-config for finding local peers (good for testnets)
+class UDPMulticast : private common::Nocopy {
+public:
+	typedef std::function<void(const std::string &addr, const unsigned char *data, size_t size)> P_handler;
+	UDPMulticast(const std::string &addr, uint16_t port, P_handler &&p_handler);
+	~UDPMulticast();
+	static void send(const std::string &addr, uint16_t port, const void *data, size_t size);  // simple synchronous send
+private:
+	class Impl;
+	std::shared_ptr<Impl> impl;  // Owned by boost async machinery
+	P_handler p_handler;
+};
+}  // namespace platform
 #endif

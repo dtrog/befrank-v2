@@ -3,63 +3,61 @@
 
 #pragma once
 
-#include <typeinfo>
 #include "ISeria.hpp"
 #include "common/MemoryStreams.hpp"
+#include "common/exception.hpp"
 
 namespace seria {
 
 class BinaryInputStream : public ISeria {
 public:
-	BinaryInputStream(common::IInputStream &strm) : stream(strm) {}
-	virtual ~BinaryInputStream() {}
+	explicit BinaryInputStream(common::IInputStream &strm) : ISeria(true, false), stream(strm) {}
 
-	virtual bool is_input() const override { return true; }
+	bool begin_object() override { return true; }
+	void object_key(common::StringView, bool optional) override {}
+	void end_object() override {}
 
-	virtual void begin_object() override {}
-	virtual void object_key(common::StringView) override {}
-	virtual void end_object() override {}
+	bool begin_map(size_t &size) override;
+	void next_map_key(std::string &name) override;
+	void end_map() override {}
 
-	virtual void begin_map(size_t &size) override;
-	virtual void next_map_key(std::string &name) override;
-	virtual void end_map() override {}
+	bool begin_array(size_t &size, bool fixed_size) override;
+	void end_array() override {}
 
-	virtual void begin_array(size_t &size, bool fixed_size = false) override;
-	virtual void end_array() override {}
+	bool seria_v(int64_t &value) override;
+	bool seria_v(uint64_t &value) override;
 
-	virtual void seria_v(uint8_t &value) override;
-	virtual void seria_v(int16_t &value) override;
-	virtual void seria_v(uint16_t &value) override;
-	virtual void seria_v(int32_t &value) override;
-	virtual void seria_v(uint32_t &value) override;
-	virtual void seria_v(int64_t &value) override;
-	virtual void seria_v(uint64_t &value) override;
-	virtual void seria_v(double &value) override;
-	virtual void seria_v(bool &value) override;
-	virtual void seria_v(std::string &value) override;
-	virtual void seria_v(common::BinaryArray &value) override;
-	virtual void binary(void *value, size_t size) override;
+	bool seria_v(bool &value) override;
+	bool seria_v(std::string &value) override;
+	bool seria_v(common::BinaryArray &value) override;
+	bool binary(void *value, size_t size) override;
 
 private:
 	common::IInputStream &stream;
 };
 
-template<typename T>
-void from_binary(T &obj, const common::BinaryArray &blob) {
+template<typename T, typename... Context>
+void from_binary(T &obj, common::MemoryInputStream &stream, Context... context) {
 	static_assert(!std::is_pointer<T>::value, "Cannot be called with pointer");
-	common::MemoryInputStream stream(blob.data(), blob.size());
 	BinaryInputStream ba(stream);
-	ba(obj);
+	try {
+		ser(obj, ba, context...);
+	} catch (const std::exception &) {
+		std::throw_with_nested(std::runtime_error(
+		    "Error while serializing binary object of type '" + common::demangle(typeid(T).name()) + "'"));
+	}
 	if (!stream.empty())
-		throw std::runtime_error("Excess data in from_binary " + std::string(typeid(T).name()));
+		throw std::runtime_error(
+		    "Excess data after serializing binary object of type '" + common::demangle(typeid(T).name()) + "'");
 }
-template<typename T>
-void from_binary(T &obj, const std::string &blob) {
-	static_assert(!std::is_pointer<T>::value, "Cannot be called with pointer");
+template<typename T, typename... Context>
+void from_binary(T &obj, const common::BinaryArray &blob, Context... context) {
 	common::MemoryInputStream stream(blob.data(), blob.size());
-	BinaryInputStream ba(stream);
-	ba(obj);
-	if (!stream.empty())
-		throw std::runtime_error("Excess data in from_binary " + std::string(typeid(T).name()));
+	from_binary(obj, stream, context...);
 }
+template<typename T, typename... Context>
+void from_binary(T &obj, const std::string &blob, Context... context) {
+	common::MemoryInputStream stream(blob.data(), blob.size());
+	from_binary(obj, stream, context...);
 }
+}  // namespace seria

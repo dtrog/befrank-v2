@@ -3,25 +3,21 @@
 
 #pragma once
 
-#include <list>
 #include <memory>
-#include <mutex>
+#include <vector>
 #include "LoggerGroup.hpp"
 #include "LoggerMessage.hpp"
-#include "common/JsonValue.hpp"
 
 namespace logging {
 
 class LoggerManager : public LoggerGroup {
 public:
-	LoggerManager();
-	void configure_default(const std::string &log_folder, const std::string &log_prefix);  // log_folder must exist
-	void configure(const common::JsonValue &val);
-	virtual void operator()(
-	    const std::string &category, Level level, boost::posix_time::ptime time, const std::string &body) override;
+	LoggerManager() = default;
+	void configure_default(const std::string &log_folder, const std::string &log_prefix, const std::string &version);
+	// log_folder must exist
+	virtual void write(const std::string &category, Level level, std::time_t time, const std::string &body) override;
 
 private:
 	std::vector<std::unique_ptr<CommonLogger>> loggers;
-	std::mutex reconfigure_lock;
 };
-}
+}  // namespace logging

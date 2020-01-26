@@ -3,19 +3,22 @@
 
 #include "ConsoleLogger.hpp"
 #include <iostream>
-#include <unordered_map>
 #include "common/ConsoleTools.hpp"
 
 namespace logging {
 
 using common::console::Color;
 
+#ifndef __EMSCRIPTEN__
 std::mutex ConsoleLogger::mutex;
+#endif
 
 ConsoleLogger::ConsoleLogger(Level level) : CommonLogger(level) {}
 
 void ConsoleLogger::do_log_string(const std::string &message) {
+#ifndef __EMSCRIPTEN__
 	std::lock_guard<std::mutex> lock(mutex);
+#endif
 	bool changed_color = false;
 
 	for (size_t char_pos = 0; char_pos < message.size(); ++char_pos) {
@@ -30,9 +33,9 @@ void ConsoleLogger::do_log_string(const std::string &message) {
 		}
 	}
 
+	std::cout << std::flush;
 	if (changed_color) {
-		std::cout << std::flush;
 		common::console::set_text_color(Color::Default);
 	}
 }
-}
+}  // namespace logging

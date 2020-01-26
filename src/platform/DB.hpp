@@ -3,10 +3,15 @@
 
 #pragma once
 
-#if platform_USE_SQLITE
+#ifdef __EMSCRIPTEN__
+#include "platform/DBmemory.hpp"
+namespace platform {
+typedef DBmemory DB;
+}
+#elif platform_USE_SQLITE
 #include "platform/DBsqlite3.hpp"
 namespace platform {
-typedef DBsqlite DB;
+typedef DBsqliteKV DB;
 }
 #else
 #include "platform/DBlmdb.hpp"

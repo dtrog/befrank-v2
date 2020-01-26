@@ -9,71 +9,89 @@
 
 namespace seria {
 
+// Common base for use with dynamic_cast in ser() methods
 class JsonOutputStream : public ISeria {
+protected:
+	bool numbers_as_strings = false;
+
 public:
-	JsonOutputStream();
+	JsonOutputStream() : ISeria(false, true) {}
+	void set_numbers_as_strings(bool v) { numbers_as_strings = v; }
+};
 
-	virtual bool is_input() const override { return false; }
+class JsonOutputStreamValue : public JsonOutputStream {
+public:
+	JsonOutputStreamValue();
 
-	virtual void begin_object() override;
-	virtual void object_key(common::StringView name) override;
-	virtual void end_object() override;
+	bool begin_object() override;
+	void object_key(common::StringView name, bool optional) override;
+	void end_object() override;
 
-	virtual void begin_map(size_t &) override { begin_object(); }
-	virtual void next_map_key(std::string &name) override;
-	virtual void end_map() override { end_object(); }
+	bool begin_map(size_t &) override { return begin_object(); }
+	void next_map_key(std::string &name) override;
+	void end_map() override { end_object(); }
 
-	virtual void begin_array(size_t &size, bool fixed_size = false) override;
-	virtual void end_array() override;
+	bool begin_array(size_t &size, bool fixed_size) override;
+	void end_array() override;
 
-	virtual void seria_v(uint8_t &value) override;
-	virtual void seria_v(int16_t &value) override;
-	virtual void seria_v(uint16_t &value) override;
-	virtual void seria_v(int32_t &value) override;
-	virtual void seria_v(uint32_t &value) override;
-	virtual void seria_v(int64_t &value) override;
-	virtual void seria_v(uint64_t &value) override;
-	virtual void seria_v(double &value) override;
-	virtual void seria_v(bool &value) override;
-	virtual void seria_v(std::string &value) override;
-	virtual void seria_v(common::BinaryArray &value) override;
-	virtual void binary(void *value, size_t size) override;
-	const common::JsonValue &get_value() const { return root; }
+	bool seria_v(int64_t &value) override;
+	bool seria_v(uint64_t &value) override;
+
+	bool seria_v(bool &value) override;
+	bool seria_v(std::string &value) override;
+	bool seria_v(common::BinaryArray &value) override;
+	bool binary(void *value, size_t size) override;
+
+	common::JsonValue move_value() { return std::move(root); }
 
 private:
 	bool expecting_root = true;
-	common::StringView next_key;
+	common::StringView m_next_key;
+	bool next_optional = false;
 	common::JsonValue root;
 	std::vector<common::JsonValue *> chain;
 
-	common::JsonValue *insert_or_push(const common::JsonValue &value, bool optional) {
-		if (chain.empty()) {
-			if (!expecting_root)
-				throw std::logic_error("JsonOutputStream::begin_object unexpected root");
-			root           = common::JsonValue(value);
-			expecting_root = false;
-			return &root;
-		}
-		auto js = chain.back();
-		if (js->is_array()) {
-			return &js->push_back(value);
-		}
-		if (js->is_object()) {
-			common::StringView key = next_key;
-			next_key               = common::StringView("");
-			if (optional)
-				return nullptr;
-			return &js->insert((std::string)key, value);
-		}
-		throw std::logic_error("JsonOutputStream::insert_or_push can only insert into object array or root");
-	}
+	common::JsonValue *insert_or_push(const common::JsonValue &value, bool skip_if_optional);
 };
 
-template<typename T>
-common::JsonValue to_json_value(const T &v) {
+class JsonOutputStreamText : public JsonOutputStream {
+public:
+	explicit JsonOutputStreamText(std::string &text) : text(text) {}
+
+	bool begin_object() override;
+	void object_key(common::StringView name, bool optional) override;
+	void end_object() override;
+
+	bool begin_map(size_t &) override { return begin_object(); }
+	void next_map_key(std::string &name) override;
+	void end_map() override { end_object(); }
+
+	bool begin_array(size_t &size, bool fixed_size) override;
+	void end_array() override;
+
+	bool seria_v(int64_t &value) override;
+	bool seria_v(uint64_t &value) override;
+
+	bool seria_v(bool &value) override;
+	bool seria_v(std::string &value) override;
+	bool seria_v(common::BinaryArray &value) override;
+	bool binary(void *value, size_t size) override;
+
+private:
+	bool expecting_root = true;
+	common::StringView m_next_key;
+	bool next_optional = false;
+	std::string &text;
+	std::vector<std::pair<common::JsonValue::Type, int>>
+	    chain;  // object, array or null (for empty array) only + count of elements
+	bool append_prefix(const std::string &value, bool skip_if_optional);
+};
+
+template<typename T, typename... Context>
+common::JsonValue to_json_value(const T &v, Context... context) {
 	static_assert(!std::is_pointer<T>::value, "Cannot be called with pointer");
-	JsonOutputStream s;
-	s(const_cast<T &>(v));
-	return s.get_value();
+	JsonOutputStreamValue s;
+	ser(const_cast<T &>(v), s, context...);
+	return s.move_value();
 }
-}
+}  // namespace seria

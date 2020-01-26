@@ -12,7 +12,7 @@ class ExclusiveLock {
 public:
 	class FailedToLock : public std::runtime_error {
 	public:
-		explicit FailedToLock(const std::string &msg) : std::runtime_error(msg) {}
+		using std::runtime_error::runtime_error;
 	};
 	explicit ExclusiveLock(const std::string &folder, const std::string &file);
 	~ExclusiveLock();
@@ -24,4 +24,4 @@ private:
 	int fd = 0;
 #endif
 };
-}
+}  // namespace platform

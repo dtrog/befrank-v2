@@ -3,187 +3,181 @@
 
 #pragma once
 
-#include <condition_variable>
-#include <mutex>
 #include <set>
-#include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include "BlockChain.hpp"
+#include "Multicore.hpp"
 #include "crypto/hash.hpp"
-#include "logging/LoggerMessage.hpp"
 
-namespace bytecoin {
+namespace cn {
 
 class Config;
 
 class IBlockChainState {
 public:
-	virtual ~IBlockChainState() {}
-	virtual void store_keyimage(const KeyImage &, Height) = 0;
-	virtual void delete_keyimage(const KeyImage &)     = 0;
-	virtual bool read_keyimage(const KeyImage &) const = 0;
+	struct OutputIndexData {
+		Amount amount;  // We will serialize encrypted amount if amount == 0
+		BlockOrTimestamp unlock_block_or_timestamp = 0;
+		PublicKey public_key;
+		Height height    = 0;
+		uint8_t spent    = 0;  // Aftermath of "keyimage out of subgroup" attack
+		bool is_amethyst = false;
+		std::vector<size_t> dins;
+	};
+	virtual ~IBlockChainState()                                  = default;
+	virtual void store_keyimage(const KeyImage &, Height)        = 0;
+	virtual void delete_keyimage(const KeyImage &)               = 0;
+	virtual bool read_keyimage(const KeyImage &, Height *) const = 0;
 
-	virtual uint32_t push_amount_output(
-	    Amount, UnlockMoment, Height block_height, Timestamp block_unlock_timestamp, const PublicKey &) = 0;
-	virtual void pop_amount_output(Amount, UnlockMoment, const PublicKey &) = 0;
-	virtual uint32_t next_global_index_for_amount(Amount) const = 0;
-	virtual bool read_amount_output(Amount, uint32_t global_index, UnlockMoment *, PublicKey *) const = 0;
-};
-
-struct RingSignatureArg {
-	Hash tx_prefix_hash;
-	KeyImage key_image;
-	std::vector<PublicKey> output_keys;
-	std::vector<Signature> signatures;
-};
-
-class RingCheckerMulticore {
-	std::vector<std::thread> threads;
-	mutable std::mutex mu;
-	mutable std::condition_variable have_work;
-	mutable std::condition_variable result_ready;
-	bool quit = false;
-
-	size_t total_counter = 0;
-	size_t ready_counter = 0;
-	std::vector<std::string> errors;
-
-	std::deque<RingSignatureArg> args;
-	int work_counter = 0;
-	void thread_run();
-
-public:
-	RingCheckerMulticore();
-	~RingCheckerMulticore();
-	void cancel_work();
-	std::string start_work_get_error(IBlockChainState *state, const Currency &currency, const Block &block,
-	    Height unlock_height, Timestamp unlock_timestamp);  // can fail immediately
-	bool signatures_valid() const;
+	virtual size_t push_amount_output(Amount, BlockOrTimestamp, Height, const PublicKey &, bool is_amethyst) = 0;
+	virtual void pop_amount_output(Amount, BlockOrTimestamp, const PublicKey &)                              = 0;
+	virtual size_t next_stack_index_for_amount(Amount) const                                                 = 0;
+	virtual bool read_amount_output(Amount, size_t stack_index, OutputIndexData *) const                     = 0;
 };
 
 class BlockChainState : public BlockChain, private IBlockChainState {
 public:
+	class Exception : public std::runtime_error {
+	public:
+		using std::runtime_error::runtime_error;
+	};
 	BlockChainState(logging::ILogger &, const Config &, const Currency &, bool read_only);
 
-	const Currency &get_currency() const { return m_currency; };
-	uint32_t get_next_effective_median_size() const;
+	std::vector<api::Output> get_random_outputs(uint8_t block_major_version, Amount, size_t output_count, Height,
+	    Timestamp block_timestamp, Timestamp block_median_timestamp) const;
+	typedef std::vector<std::vector<size_t>> BlockStackIndexes;
+	bool read_block_output_stack_indexes(const Hash &bid, BlockStackIndexes *) const;
+	bool read_block_output_stack_indexes_data(const Hash &bid, BinaryArray *) const;
+	api::cnd::SyncBlocks::RawBlockCompact fill_sync_block_compact(const Hash &bid) const;
 
-	std::vector<api::Output> get_outputs_by_amount(Amount, size_t anonymity, Height, Timestamp) const;
-	typedef std::vector<std::vector<uint32_t>> BlockGlobalIndices;
-	bool read_block_output_global_indices(const Hash &bid, BlockGlobalIndices *) const;
+	Amount minimum_pool_fee_per_byte(bool zero_if_not_full, Hash *minimal_tid = nullptr) const;
+	bool add_transaction(const Hash &tid, const Transaction &, const BinaryArray &binary_tx, bool check_sigs,
+	    const std::string &source_address);
+	bool get_largest_referenced_height(const TransactionPrefix &tx, Height *block_height) const;
 
-	Amount minimum_pool_fee_per_byte(Hash *minimal_tid) const;
-	AddTransactionResult add_transaction(
-	    const Hash &tid, const Transaction &, const BinaryArray &binary_tx, Timestamp now);
-
-	uint32_t get_tx_pool_version() const { return m_tx_pool_version; }
+	size_t get_tx_pool_version() const { return m_tx_pool_version; }
 	struct PoolTransaction {
 		Transaction tx;
 		BinaryArray binary_tx;
+		Amount amount;
 		Amount fee;
+		Timestamp timestamp;
+		Hash newest_referenced_block;
 
-		PoolTransaction(const Transaction &tx, const BinaryArray &binary_tx, Amount fee);
+		PoolTransaction(const Transaction &tx, const BinaryArray &binary_tx, Amount fee, Timestamp timestamp,
+		    const Hash &newest_referenced_block);
 		Amount fee_per_byte() const { return fee / binary_tx.size(); }
 	};
-	typedef std::map<Hash, Transaction> TransMap;
 	typedef std::map<Hash, PoolTransaction> PoolTransMap;
 	const PoolTransMap &get_memory_state_transactions() const { return m_memory_state_tx; }
+	std::vector<TransactionDesc> sync_pool(
+	    const std::pair<Amount, Hash> &from, const std::pair<Amount, Hash> &to, size_t max_count) const;
 
-	bool create_mining_block_template(
-	    BlockTemplate *, const AccountPublicAddress &, const BinaryArray &extra_nonce, Difficulty *, Height *) const;
-	BroadcastAction add_mined_block(const BinaryArray &raw_block_template, RawBlock *, api::BlockHeader *);
-	Timestamp read_first_seen_timestamp(const Hash &tid) const;  // 0 if does not exist
+	void create_mining_block_template(const Hash &, const AccountAddress &, const BinaryArray &extra_nonce,
+	    const Hash &miner_secret, BlockTemplate *, Difficulty *, Height *, size_t *) const;
+	bool add_mined_block(const BinaryArray &raw_block_template, RawBlock *, api::BlockHeader *);
 
-	static api::BlockHeader fill_genesis(Hash genesis_bid, const BlockTemplate &);
+	void dump_outputs_quality(size_t max_count) const;
 
-	void test_print_outputs();
+	void fill_statistics(api::cnd::GetStatistics::Response &res) const override;
+	std::vector<api::Output> get_mixed_outputs(uint8_t tx_version, size_t input_index, const InputKey &in) const;
 
 protected:
-	virtual std::string check_standalone_consensus(
-	    const PreparedBlock &pb, api::BlockHeader *info, const api::BlockHeader &prev_info, bool check_pow) const override;
-	virtual bool redo_block(const Hash &bhash, const Block &, const api::BlockHeader &) override;
-	virtual void undo_block(const Hash &bhash, const Block &, Height) override;
+	// We add side chain to blocktree block by block, before switching to it when it becomes the best
+	// check_consensus checks everything that can be checked by blocktree structure only
+	void check_consensus(const PreparedBlock &pb, api::BlockHeader *info, const api::BlockHeader &prev_info,
+	    bool check_pow) const override;
+	void redo_block(const Hash &bhash, const Block &, const api::BlockHeader &) override;  // throws ConsensusError
+	void undo_block(const Hash &bhash, const Block &, Height) override;
 
 private:
 	class DeltaState : public IBlockChainState {
 		std::map<KeyImage, Height> m_keyimages;  // sorted to speed up bulk saving to DB
-		std::map<Amount, std::vector<std::pair<uint64_t, PublicKey>>> m_global_amounts;
-
+		std::map<Amount, std::vector<std::tuple<uint64_t, PublicKey, bool>>> m_global_amounts;
+		std::vector<OutputIndexData> m_ordered_global_amounts;
 		Height m_block_height;  // Every delta state corresponds to some height
-		Timestamp m_unlock_timestamp;
+		Timestamp m_block_timestamp;
+		Timestamp m_block_median_timestamp;
 		const IBlockChainState *m_parent_state;  // const parent to prevent accidental parent modification
 	public:
-		explicit DeltaState(Height block_height, Timestamp unlock_timestamp, const IBlockChainState *parent_state)
-		    : m_block_height(block_height), m_unlock_timestamp(unlock_timestamp), m_parent_state(parent_state) {}
+		explicit DeltaState(Height block_height, Timestamp block_timestamp, Timestamp block_median_timestamp,
+		    const IBlockChainState *parent_state)
+		    : m_block_height(block_height)
+		    , m_block_timestamp(block_timestamp)
+		    , m_block_median_timestamp(block_median_timestamp)
+		    , m_parent_state(parent_state) {}
 		Height get_block_height() const { return m_block_height; }
-		Height get_unlock_timestamp() const { return m_unlock_timestamp; }
+		Height get_block_timestamp() const { return m_block_timestamp; }
+		Height get_block_median_timestamp() const { return m_block_median_timestamp; }
 		void apply(IBlockChainState *parent_state) const;  // Apply modifications to (non-const) parent
 		void clear(Height new_block_height);               // We use it for memory_state
 		const std::map<KeyImage, Height> &get_keyimages() const { return m_keyimages; }
 
-		virtual void store_keyimage(const KeyImage &, Height) override;
-		virtual void delete_keyimage(const KeyImage &) override;
-		virtual bool read_keyimage(const KeyImage &) const override;
+		void store_keyimage(const KeyImage &, Height) override;
+		void delete_keyimage(const KeyImage &) override;
+		bool read_keyimage(const KeyImage &, Height *) const override;
 
-		virtual uint32_t push_amount_output(
-		    Amount, UnlockMoment, Height block_height, Timestamp block_unlock_timestamp, const PublicKey &) override;
-		virtual void pop_amount_output(Amount, UnlockMoment, const PublicKey &) override;
-		virtual uint32_t next_global_index_for_amount(Amount) const override;
-		virtual bool read_amount_output(Amount, uint32_t global_index, UnlockMoment *, PublicKey *) const override;
+		size_t push_amount_output(Amount, BlockOrTimestamp, Height, const PublicKey &, bool is_amethyst) override;
+		void pop_amount_output(Amount, BlockOrTimestamp, const PublicKey &) override;
+		size_t next_stack_index_for_amount(Amount) const override;
+		bool read_amount_output(Amount, size_t stack_index, OutputIndexData *) const override;
 	};
 
-	virtual void store_keyimage(const KeyImage &, Height) override;
-	virtual void delete_keyimage(const KeyImage &) override;
-	virtual bool read_keyimage(const KeyImage &) const override;
+	void store_keyimage(const KeyImage &, Height) override;
+	void delete_keyimage(const KeyImage &) override;
+	bool read_keyimage(const KeyImage &, Height *) const override;
 
-	virtual uint32_t push_amount_output(
-	    Amount, UnlockMoment, Height block_height, Timestamp block_unlock_timestamp, const PublicKey &) override;
-	virtual void pop_amount_output(Amount, UnlockMoment, const PublicKey &) override;
-	virtual uint32_t next_global_index_for_amount(Amount) const override;
-	virtual bool read_amount_output(Amount, uint32_t global_index, UnlockMoment *, PublicKey *) const override;
+	size_t push_amount_output(Amount, BlockOrTimestamp, Height, const PublicKey &, bool is_amethyst) override;
+	void pop_amount_output(Amount, BlockOrTimestamp, const PublicKey &) override;
+	size_t next_stack_index_for_amount(Amount) const override;
+	bool read_amount_output(Amount, size_t stack_index, OutputIndexData *) const override;
+	bool read_hidden_amount_map(Amount, size_t stack_index, size_t *hidden_index) const;
+	bool read_hidden_amount_output(size_t hidden_index, OutputIndexData *) const;
+	void spend_output(OutputIndexData &&, size_t hidden_index, size_t trigger_input_index, size_t level, bool spent);
 
-	std::string redo_transaction_get_error(
-	    bool generating, const Transaction &, DeltaState *, BlockGlobalIndices *, bool check_sigs) const;
-	bool redo_block(const Block &, const api::BlockHeader &, DeltaState *, BlockGlobalIndices *) const;
+	void redo_transaction(uint8_t major_block_version, bool coinbase, const Transaction &, DeltaState *,
+	    BlockStackIndexes *, Hash *newest_referenced_bid,
+	    bool check_sigs) const;  // throws ConsensusError
+	void redo_block(
+	    const Block &, const api::BlockHeader &, DeltaState *, BlockStackIndexes *) const;  // throws ConsensusError
 
 	void undo_transaction(IBlockChainState *delta_state, Height, const Transaction &);
 
-	//	const Config &m_config;
-	const Currency &m_currency;
-	logging::LoggerRef m_log;
+	const size_t m_max_pool_size;
 	mutable crypto::CryptoNightContext m_hash_crypto_context;
-	mutable std::unordered_map<Amount, uint32_t>
-	    m_next_gi_for_amount;  // Read from db on first use, write on modification
+	mutable std::unordered_map<Amount, size_t> m_next_stack_index;
+	// Read from db on first use, write on modification
 
-	void update_first_seen_timestamp(const Hash &tid, Timestamp now);  // 0 to delete
-
-	AddTransactionResult add_transaction(const Hash &tid, const Transaction &tx, const BinaryArray &binary_tx,
-	    Height unlock_height, Timestamp unlock_timestamp, bool check_sigs);
 	void remove_from_pool(Hash tid);
 
-	uint32_t m_tx_pool_version = 2;  // Incremented every time pool changes, reset to 2 on redo block. 2 is selected
-	                                 // because wallet resets to 1, so after both reset pool versions do not equal
+	size_t m_tx_pool_version = 1;  // Incremented every time pool changes, TODO cycle
 	PoolTransMap m_memory_state_tx;
 	std::map<KeyImage, Hash> m_memory_state_ki_tx;
-	std::map<Amount, std::set<Hash>> m_memory_state_fee_tx;
+	std::set<std::pair<Amount, Hash>> m_memory_state_fee_tx;
 	size_t m_memory_state_total_size = 0;
 
 	mutable std::map<Hash, std::pair<BinaryArray, Height>> m_mining_transactions;
 	// We remember them for several blocks
 	void clear_mining_transactions() const;
+	size_t m_next_global_key_output_index = 0;
+	size_t m_next_nz_input_index          = 0;
+	void process_input(const Hash &tid, size_t iid, const InputKey &input);
+	void unprocess_input(const InputKey &input);
 
-	Timestamp m_next_median_timestamp = 0;
-	Timestamp m_next_unlock_timestamp = 0;
-	uint32_t m_next_median_size       = 0;
-	virtual void tip_changed() override;  // Updates values above
-	virtual void on_reorganization(
+	Timestamp m_next_median_timestamp        = 0;
+	size_t m_next_median_size                = 0;
+	size_t m_next_median_block_capacity_vote = 0;
+	void tip_changed() override;  // Updates values above
+	void on_reorganization(
 	    const std::map<Hash, std::pair<Transaction, BinaryArray>> &undone_transactions, bool undone_blocks) override;
-	void calculate_consensus_values(const api::BlockHeader &prev_info, uint32_t *next_median_size,
-	    Timestamp *next_median_timestamp, Timestamp *next_unlock_timestamp) const;
+	Timestamp calculate_next_median_timestamp(const api::BlockHeader &prev_info) const;
+	size_t calculate_next_median_size(const api::BlockHeader &prev_info) const;
+	size_t calculate_next_median_block_capacity_vote(const api::BlockHeader &prev_info) const;
 
-	RingCheckerMulticore ring_checker;
-	std::chrono::steady_clock::time_point log_redo_block_timestamp;
+	RingCheckerMulticore m_ring_checker;
+	RingSignatureCheckArgs fill_ring_check_args(const Transaction &transaction, uint8_t major_block_version,
+	    Height unlock_height, Timestamp block_timestamp, Timestamp block_median_timestamp) const;
+	std::chrono::steady_clock::time_point m_log_redo_block_timestamp;
 };
 
-}  // namespace bytecoin
+}  // namespace cn

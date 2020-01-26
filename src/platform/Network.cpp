@@ -2,7 +2,15 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include "Network.hpp"
+#include "Time.hpp"
 #include "common/MemoryStreams.hpp"
+#include "common/StringTools.hpp"
+#include "common/exception.hpp"
+#include "common/string.hpp"
+
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <ifaddrs.h>
+#endif
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")   // Windows SDK sockets
@@ -16,31 +24,127 @@ static std::pair<bool, std::string> split_ssl_address(const std::string &addr) {
 	bool ssl                  = false;
 	const std::string prefix1("https://");
 	const std::string prefix2("ssl://");
-	if (addr.find(prefix1) == 0) {
+	if (common::starts_with(addr, prefix1)) {
 		stripped_addr = addr.substr(prefix1.size());
 		ssl           = true;
-	} else if (addr.find(prefix2) == 0) {
+	} else if (common::starts_with(addr, prefix2)) {
 		stripped_addr = addr.substr(prefix2.size());
 		ssl           = true;
 	}
 	return std::make_pair(ssl, stripped_addr);
 }
-#if defined(__ANDROID__)
+#ifdef __EMSCRIPTEN__
+
+#include <emscripten/emscripten.h>
+
+class Timer::Impl {
+public:
+	explicit Impl(Timer *owner) : owner(owner), pending_wait(false) {}
+	Timer *owner;
+	bool pending_wait;
+
+	void close() {
+		if (pending_wait) {
+			owner->impl.release();  // owned by JS now
+			owner = nullptr;
+		}
+	}
+	static void static_handle_timeout(void *arg) { reinterpret_cast<Impl *>(arg)->handle_timeout(); }
+	void handle_timeout() {
+		pending_wait = false;
+		if (owner)
+			return owner->a_handler();
+		delete this;  // was owned by JS
+	}
+	void start_timer(float after_seconds) {
+		// assert(pending_wait == false);
+		pending_wait = true;
+		emscripten_async_call(static_handle_timeout, this, static_cast<int>(after_seconds * 1000));
+	}
+};
+
+Timer::Timer(after_handler &&a_handler) : a_handler(std::move(a_handler)) {}
+
+Timer::~Timer() { cancel(); }
+
+void Timer::cancel() {
+	if (impl)
+		impl->close();
+}
+
+bool Timer::is_set() const { return impl && impl->pending_wait; }
+
+void Timer::once(float after_seconds) {
+	cancel();
+	if (!impl)
+		impl = std::make_unique<Impl>(this);
+	impl->start_timer(after_seconds / get_time_multiplier_for_tests());
+}
+
+#elif platform_USE_QT
 #include <QSslSocket>
 
-Timer::Timer(after_handler a_handler) : a_handler(a_handler), impl(nullptr) {
+// thread_local EventLoop *EventLoop::current_loop = nullptr;
+
+// EventLoop::EventLoop() {
+//	if (current_loop)
+//		throw std::logic_error("RunLoop::RunLoop Only single RunLoop per thread is allowed");
+//	current_loop = this;
+//}
+
+// EventLoop::~EventLoop() { current_loop = nullptr; }
+
+Timer::Timer(after_handler a_handler) : a_handler(std::move(a_handler)), impl(nullptr) {
 	QObject::connect(&impl, &QTimer::timeout, [this]() { this->a_handler(); });
 	impl.setSingleShot(true);
 }
 
 void Timer::cancel() { impl.stop(); }
 
+bool Timer::is_set() const { return impl.isActive(); }
+
 void Timer::once(float after_seconds) {
 	cancel();
-	impl.start(static_cast<int>(after_seconds * 1000));
+	impl.start(static_cast<int>(after_seconds * 1000.0f / get_time_multiplier_for_tests()));
 }
 
-TCPSocket::TCPSocket(RW_handler rw_handler, D_handler d_handler) : rw_handler(rw_handler), d_handler(d_handler) {}
+SafeMessageImpl::SafeMessageImpl(SafeMessage *owner) : owner(owner) {}
+SafeMessageImpl::~SafeMessageImpl() {}
+
+void SafeMessageImpl::close() {
+	if (counter != 0) {
+		owner->impl.release();  // owned by JS now
+		owner = nullptr;
+	}
+}
+
+void SafeMessageImpl::handle_event() {
+	auto after = --counter;
+	if (owner)
+		return owner->a_handler();
+	if (after == 0)
+		delete this;  // was owned by JS
+}
+
+SafeMessage::SafeMessage(after_handler &&a_handler) : a_handler(std::move(a_handler)) {
+	impl = std::make_unique<SafeMessageImpl>(this);
+}
+
+SafeMessage::~SafeMessage() { impl->close(); }
+
+void SafeMessage::cancel() {
+	impl->close();
+	if (!impl)
+		impl = std::make_unique<SafeMessageImpl>(this);
+}
+
+void SafeMessage::fire() {
+	++impl->counter;
+	QMetaObject::invokeMethod(impl.get(), "handle_event", Qt::QueuedConnection);
+}
+
+TCPSocket::TCPSocket(RW_handler rw_handler, D_handler d_handler)
+    : rw_handler(std::move(rw_handler)), d_handler(std::move(d_handler)) {}
 
 void TCPSocket::close() {
 	if (impl) {
@@ -67,7 +171,7 @@ bool TCPSocket::connect(const std::string &addr, uint16_t port) {
 			    QString str;
 			    for (const auto &error : errors)
 				    str = error.errorString();
-			});
+		    });
 		QObject::connect(s.get(), &QSslSocket::encrypted, [this]() {
 			this->ready = true;
 			this->rw_handler(true, true);
@@ -85,7 +189,7 @@ bool TCPSocket::connect(const std::string &addr, uint16_t port) {
 			    qDebug() << this->impl->errorString();
 			    this->close();
 			    this->d_handler();
-			});
+		    });
 		s->connectToHostEncrypted(QString::fromUtf8(ssl_addr.second.data(), ssl_addr.second.size()), port);
 		impl = std::move(s);
 	} else {
@@ -106,7 +210,7 @@ bool TCPSocket::connect(const std::string &addr, uint16_t port) {
 		    [this](QAbstractSocket::SocketError err) {
 			    this->close();
 			    this->d_handler();
-			});
+		    });
 		impl->connectToHost(QString::fromUtf8(ssl_addr.second.data(), ssl_addr.second.size()), port);
 	}
 	return true;
@@ -135,7 +239,7 @@ void TCPSocket::shutdown_both() {
 #include "common/MemoryStreams.hpp"
 
 void Timer::static_once(CFRunLoopTimerRef impl, void *info) {
-	Timer *t = (Timer *)info;
+	Timer *t = reinterpret_cast<Timer *>(info);
 	t->a_handler();
 }
 
@@ -148,10 +252,12 @@ void Timer::cancel() {
 	impl = nullptr;
 }
 
+bool Timer::is_set() const { return impl; }
+
 void Timer::once(float after_seconds) {
 	cancel();
 	CFRunLoopTimerContext TimerContext = {0, this, nullptr, nullptr, nullptr};
-	CFAbsoluteTime FireTime            = CFAbsoluteTimeGetCurrent() + after_seconds;
+	CFAbsoluteTime FireTime            = CFAbsoluteTimeGetCurrent() + after_seconds / get_time_multiplier_for_tests();
 	impl = CFRunLoopTimerCreate(kCFAllocatorDefault, FireTime, 0, 0, 0, &Timer::static_once, &TimerContext);
 	CFRunLoopAddTimer(CFRunLoopGetCurrent(), impl, kCFRunLoopDefaultMode);
 }
@@ -224,7 +330,7 @@ bool TCPSocket::connect(const std::string &addr, uint16_t port) {
 size_t TCPSocket::read_some(void *val, size_t count) {
 	if (!read_stream || !CFReadStreamHasBytesAvailable(read_stream))
 		return 0;
-	CFIndex bytes_read = CFReadStreamRead(read_stream, (unsigned char *)val, count);
+	CFIndex bytes_read = CFReadStreamRead(read_stream, reinterpret_cast<unsigned char *>(val), count);
 	if (bytes_read <= 0) {  // error or end of stream
 		return 0;
 	}
@@ -234,7 +340,7 @@ size_t TCPSocket::read_some(void *val, size_t count) {
 size_t TCPSocket::write_some(const void *val, size_t count) {
 	if (!write_stream || !CFWriteStreamCanAcceptBytes(write_stream))
 		return 0;
-	CFIndex bytes_written = CFWriteStreamWrite(write_stream, (const unsigned char *)val, count);
+	CFIndex bytes_written = CFWriteStreamWrite(write_stream, reinterpret_cast<unsigned char *>(val), count);
 	if (bytes_written <= 0) {  // error or end of stream
 		return 0;
 	}
@@ -244,17 +350,17 @@ size_t TCPSocket::write_some(const void *val, size_t count) {
 void TCPSocket::shutdown_both() {
 	if (!is_open())
 		return;
-	CFDataRef da = (CFDataRef)CFWriteStreamCopyProperty(write_stream, kCFStreamPropertySocketNativeHandle);
+	CFDataRef da = static_cast<CFDataRef>(CFWriteStreamCopyProperty(write_stream, kCFStreamPropertySocketNativeHandle));
 	if (!da)
 		return;
 	CFSocketNativeHandle handle;
-	CFDataGetBytes(da, CFRangeMake(0, sizeof(CFSocketNativeHandle)), (unsigned char *)&handle);
+	CFDataGetBytes(da, CFRangeMake(0, sizeof(CFSocketNativeHandle)), reinterpret_cast<unsigned char *>(&handle));
 	CFRelease(da);
 	::shutdown(handle, SHUT_RDWR);
 }
 
 void TCPSocket::read_callback(CFReadStreamRef stream, CFStreamEventType event, void *my_ptr) {
-	TCPSocket *s = (TCPSocket *)my_ptr;
+	TCPSocket *s = reinterpret_cast<TCPSocket *>(my_ptr);
 	switch (event) {
 	case kCFStreamEventHasBytesAvailable:
 		s->rw_handler(true, true);
@@ -274,7 +380,7 @@ void TCPSocket::read_callback(CFReadStreamRef stream, CFStreamEventType event, v
 }
 
 void TCPSocket::write_callback(CFWriteStreamRef stream, CFStreamEventType event, void *my_ptr) {
-	TCPSocket *s = (TCPSocket *)my_ptr;
+	TCPSocket *s = reinterpret_cast<TCPSocket *>(my_ptr);
 	switch (event) {
 	case kCFStreamEventCanAcceptBytes:
 		s->rw_handler(true, true);
@@ -295,12 +401,12 @@ void TCPSocket::write_callback(CFWriteStreamRef stream, CFStreamEventType event,
 #include <algorithm>
 #include <boost/array.hpp>
 #include <boost/asio.hpp>
-#include <boost/bind.hpp>
 #include <iostream>
+
+using namespace std::placeholders;  // We enjoy standard bindings
 
 #if platform_USE_SSL
 #include <boost/asio/ssl.hpp>
-#include <common/string.hpp>
 
 namespace ssl = boost::asio::ssl;
 typedef ssl::stream<boost::asio::ip::tcp::socket> SSLSocket;
@@ -405,48 +511,65 @@ static void add_system_root_certs(ssl::context &ctx) {
 }
 #endif
 
-// static thread_local std::shared_ptr<ssl::context> shared_client_context;
 #endif
 
 thread_local EventLoop *EventLoop::current_loop = nullptr;
 
 EventLoop::EventLoop(boost::asio::io_service &io_service) : io_service(io_service) {
-	if (current_loop != 0)
+	if (current_loop)
 		throw std::logic_error("RunLoop::RunLoop Only single RunLoop per thread is allowed");
 	current_loop = this;
 }
 
-EventLoop::~EventLoop() {
-	current_loop = nullptr;
-	//#if platform_USE_SSL
-	//	shared_client_context.reset();
-	//#endif
-}
+EventLoop::~EventLoop() { current_loop = nullptr; }
 
 void EventLoop::cancel() { io_service.stop(); }
 
 void EventLoop::run() { io_service.run(); }
-void EventLoop::wake() {
-	io_service.post([](void) {});
+void EventLoop::wake(std::function<void()> &&a_handler) { io_service.post(std::move(a_handler)); }
+
+class SafeMessage::Impl {
+public:
+	explicit Impl(SafeMessage *owner) : owner(owner), current_loop(EventLoop::current()) {}
+	SafeMessage *owner;
+	EventLoop *current_loop;
+	std::atomic<int> counter;
+
+	void close() {
+		if (counter != 0) {
+			owner->impl.release();  // owned by JS now
+			owner = nullptr;
+		}
+	}
+	void handle_event() {
+		auto after = --counter;
+		if (owner)
+			return owner->a_handler();
+		if (after == 0)
+			delete this;  // was owned by JS
+	}
+};
+
+SafeMessage::SafeMessage(after_handler &&a_handler) : a_handler(std::move(a_handler)) {
+	impl = std::make_unique<Impl>(this);
 }
 
-// static bool ispowerof2(unsigned int x) {
-//    return x && !(x & (x - 1));
-//}
-// static unsigned global_timer_impl_counter = 0;
+SafeMessage::~SafeMessage() { impl->close(); }
+
+void SafeMessage::cancel() {
+	impl->close();
+	if (!impl)
+		impl = std::make_unique<Impl>(this);
+}
+
+void SafeMessage::fire() {
+	++impl->counter;
+	impl->current_loop->wake(std::bind(&Impl::handle_event, impl.get()));
+}
 
 class Timer::Impl {
 public:
-	explicit Impl(Timer *owner) : owner(owner), pending_wait(false), timer(EventLoop::current()->io()) {
-		//		global_timer_impl_counter += 1;
-		//		if( ispowerof2(global_timer_impl_counter) )
-		//		    std::cout << "++Timer::Impl::counter=" << global_timer_impl_counter << std::endl;
-	}
-	~Impl() {
-		//      if( ispowerof2(global_timer_impl_counter) )
-		//            std::cout << "--Timer::Impl::counter=" << global_timer_impl_counter << std::endl;
-		//		global_timer_impl_counter -= 1;
-	}
+	explicit Impl(Timer *owner) : owner(owner), pending_wait(false), timer(EventLoop::current()->io()) {}
 	Timer *owner;
 	bool pending_wait;
 	boost::asio::deadline_timer timer;
@@ -471,11 +594,11 @@ public:
 		}
 	}
 	void start_timer(float after_seconds) {
-		assert(pending_wait == false);
+		// assert(pending_wait == false);
 		pending_wait = true;
 		timer.expires_from_now(boost::posix_time::milliseconds(
 		    static_cast<int>(after_seconds * 1000)));  // int because we do not know exact type
-		timer.async_wait(boost::bind(&Impl::handle_timeout, owner->impl, boost::asio::placeholders::error));
+		timer.async_wait(std::bind(&Impl::handle_timeout, owner->impl, _1));
 	}
 };
 
@@ -484,11 +607,13 @@ void Timer::cancel() {
 		impl->close();
 }
 
+bool Timer::is_set() const { return impl && impl->pending_wait; }
+
 void Timer::once(float after_seconds) {
 	cancel();
 	if (!impl)
 		impl = std::make_shared<Impl>(this);
-	impl->start_timer(after_seconds);
+	impl->start_timer(after_seconds / get_time_multiplier_for_tests());
 }
 
 class TCPSocket::Impl {
@@ -502,7 +627,15 @@ public:
 	    , pending_connect(false)
 	    , socket(EventLoop::current()->io())
 	    , incoming_buffer(8192)
-	    , outgoing_buffer(8192) {}
+	    , outgoing_buffer(8192) {
+		//		std::cout << std::hex << "TCPSocket::Impl this=" << (size_t)this << " owner=" << (size_t)owner <<
+		// std::dec
+		//<< std::endl;
+	}
+	~Impl() {
+		//		std::cout << std::hex << "TCPSocket::~Impl this=" << (size_t)this << " owner=" << (size_t)owner <<
+		// std::dec << std::endl;
+	}
 	TCPSocket *owner;
 	bool connected;
 	bool asked_shutdown;
@@ -526,7 +659,11 @@ public:
 			socket.close();
 		TCPSocket *was_owner = owner;
 		if (pending_write || pending_read || pending_connect) {
+			//			if(socket.lowest_layer().is_open())
 			owner = nullptr;
+			//			std::cout << std::hex << "Socket close this=" << (size_t)this << " owner=" << (size_t)owner << "
+			// was_owner=" << (size_t)was_owner << std::dec << " flags" << pending_write << pending_read <<
+			// pending_connect << std::endl;
 			if (was_owner)  // error can happen on detached impl
 				was_owner->impl = std::make_shared<Impl>(was_owner);
 		} else {
@@ -557,8 +694,22 @@ public:
 			socket.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored_ec);
 	}
 
+	void set_keepalive() {
+		boost::system::error_code ec;  // we will ignore error
+#if platform_USE_SSL
+		if (ssl_socket)
+			ssl_socket->lowest_layer().set_option(boost::asio::socket_base::keep_alive(true), ec);
+		else
+#endif
+			socket.set_option(boost::asio::socket_base::keep_alive(true), ec);
+		if (ec)
+			std::cout << "Cannot set keepalive on socket, ec=" << ec << std::endl;
+	}
 	void handle_connect(const boost::system::error_code &e) {
 		if (!e) {
+			set_keepalive();
+//			std::cout << std::hex << "Socket handle_connect this=" << (size_t)this << " owner=" << (size_t)owner << "
+// was_owner=" << std::dec << " flags" << pending_write << pending_read << pending_connect << std::endl;
 #if platform_USE_SSL
 			if (ssl_socket) {
 				start_handshake(ssl::stream_base::client);
@@ -587,16 +738,16 @@ public:
 		        boost::asio::buffer(incoming_buffer.write_ptr2(), incoming_buffer.write_count2())}};
 #if platform_USE_SSL
 		if (ssl_socket)
-			ssl_socket->async_read_some(
-			    bufs, boost::bind(&Impl::handle_read, owner->impl, boost::asio::placeholders::error,
-			              boost::asio::placeholders::bytes_transferred));
+			ssl_socket->async_read_some(bufs, std::bind(&Impl::handle_read, owner->impl, _1, _2));
 		else
 #endif
-			socket.async_read_some(bufs, boost::bind(&Impl::handle_read, owner->impl, boost::asio::placeholders::error,
-			                                 boost::asio::placeholders::bytes_transferred));
+			socket.async_read_some(bufs, std::bind(&Impl::handle_read, owner->impl, _1, _2));
 	}
 
 	void handle_read(const boost::system::error_code &e, std::size_t bytes_transferred) {
+		//		std::cout << std::hex << "Socket handle_read this=" << (size_t)this << " owner=" << (size_t)owner << "
+		// e="
+		//<< !!e << std::dec << " flags" << pending_write << pending_read << pending_connect << std::endl;
 		pending_read = false;
 		if (!e) {
 			if (!asked_shutdown)
@@ -626,14 +777,10 @@ public:
 		        boost::asio::buffer(outgoing_buffer.read_ptr2(), outgoing_buffer.read_count2())}};
 #if platform_USE_SSL
 		if (ssl_socket)
-			ssl_socket->async_write_some(
-			    bufs, boost::bind(&Impl::handle_write, owner->impl, boost::asio::placeholders::error,
-			              boost::asio::placeholders::bytes_transferred));
+			ssl_socket->async_write_some(bufs, std::bind(&Impl::handle_write, owner->impl, _1, _2));
 		else
 #endif
-			socket.async_write_some(
-			    bufs, boost::bind(&Impl::handle_write, owner->impl, boost::asio::placeholders::error,
-			              boost::asio::placeholders::bytes_transferred));
+			socket.async_write_some(bufs, std::bind(&Impl::handle_write, owner->impl, _1, _2));
 	}
 
 	void handle_write(const boost::system::error_code &e, std::size_t bytes_transferred) {
@@ -651,7 +798,7 @@ public:
 	}
 #if platform_USE_SSL
 	void start_handshake(ssl::stream_base::handshake_type type) {
-		ssl_socket->async_handshake(type, boost::bind(&Impl::handle_handshake, this, boost::asio::placeholders::error));
+		ssl_socket->async_handshake(type, std::bind(&Impl::handle_handshake, this, _1));
 	}
 	void handle_handshake(const boost::system::error_code &e) {
 		pending_connect = false;
@@ -664,15 +811,15 @@ public:
 			return;
 		}
 		if (e != boost::asio::error::operation_aborted) {
-			std::cout << e << " " << e.message() << std::endl;
+			std::cout << "SSL Handshake Error - check that server supports ssl/https, " << e.message() << std::endl;
 			close(true);
 		}
 	}
 #endif
 };
 
-TCPSocket::TCPSocket(RW_handler rw_handler, D_handler d_handler)
-    : impl(std::make_shared<Impl>(this)), rw_handler(rw_handler), d_handler(d_handler) {}
+TCPSocket::TCPSocket(RW_handler &&rw_handler, D_handler &&d_handler)
+    : impl(std::make_shared<Impl>(this)), rw_handler(std::move(rw_handler)), d_handler(std::move(d_handler)) {}
 
 TCPSocket::~TCPSocket() { close(); }
 
@@ -712,15 +859,14 @@ bool TCPSocket::connect(const std::string &addr, uint16_t port) {
 			impl->ssl_socket  = std::make_unique<SSLSocket>(EventLoop::current()->io(), *impl->ssl_context);
 			if (!SSL_set_tlsext_host_name(impl->ssl_socket->native_handle(), ssl_addr.second.c_str()))
 				return false;
-			impl->ssl_socket->lowest_layer().async_connect(iter->endpoint(),
-			    boost::bind(&TCPSocket::Impl::handle_connect, impl, boost::asio::placeholders::error));
+			impl->ssl_socket->lowest_layer().async_connect(
+			    iter->endpoint(), std::bind(&TCPSocket::Impl::handle_connect, impl, _1));
 #else
 			return false;
 #endif
 		} else {
 			boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::address::from_string(ssl_addr.second), port);
-			impl->socket.async_connect(
-			    endpoint, boost::bind(&TCPSocket::Impl::handle_connect, impl, boost::asio::placeholders::error));
+			impl->socket.async_connect(endpoint, std::bind(&TCPSocket::Impl::handle_connect, impl, _1));
 		}
 	} catch (const std::exception &) {
 		return false;
@@ -753,29 +899,13 @@ void TCPSocket::shutdown_both() {
 
 class TCPAcceptor::Impl {
 public:
-	explicit Impl(TCPAcceptor *owner, bool ssl)
-	    : owner(owner)
-	    , ssl(ssl)
-	    , pending_accept(false)
-	    , acceptor(EventLoop::current()->io())
-	    , socket_being_accepted(EventLoop::current()->io())
-#if platform_USE_SSL
-	    , ssl_context(std::make_shared<ssl::context>(ssl::context::sslv23))
-	    , ssl_socket_being_accepted(
-	          ssl ? std::make_unique<SSLSocket>(EventLoop::current()->io(), *ssl_context) : nullptr)
-#endif
-	    , socket_ready(false) {
-	}
+	explicit Impl(TCPAcceptor *owner)
+	    : owner(owner), acceptor(EventLoop::current()->io()), socket_being_accepted(EventLoop::current()->io()) {}
 	TCPAcceptor *owner;
-	const bool ssl;
-	bool pending_accept;
+	bool pending_accept = false;
 	boost::asio::ip::tcp::acceptor acceptor;
 	boost::asio::ip::tcp::socket socket_being_accepted;
-#if platform_USE_SSL
-	std::shared_ptr<ssl::context> ssl_context;
-	std::unique_ptr<SSLSocket> ssl_socket_being_accepted;
-#endif
-	bool socket_ready;
+	bool socket_ready = false;
 
 	void close() {
 		acceptor.close();
@@ -790,14 +920,7 @@ public:
 		if (!owner)
 			return;
 		pending_accept = true;
-#if platform_USE_SSL
-		if (ssl)
-			acceptor.async_accept(ssl_socket_being_accepted->next_layer(),
-			    boost::bind(&Impl::handle_accept, owner->impl, boost::asio::placeholders::error));
-		else
-#endif
-			acceptor.async_accept(socket_being_accepted,
-			    boost::bind(&Impl::handle_accept, owner->impl, boost::asio::placeholders::error));
+		acceptor.async_accept(socket_being_accepted, std::bind(&Impl::handle_accept, owner->impl, _1));
 	}
 	void handle_accept(const boost::system::error_code &e) {
 		pending_accept = false;
@@ -812,25 +935,11 @@ public:
 	}
 };
 
-TCPAcceptor::TCPAcceptor(const std::string &addr, uint16_t port, A_handler a_handler, const std::string &ssl_pem_file,
-    const std::string &ssl_certificate_password)
-    : impl(std::make_shared<Impl>(this, !ssl_pem_file.empty())), a_handler(a_handler) {
-
-#if platform_USE_SSL
-	if (impl->ssl) {
-		impl->ssl_context->set_options(
-		    ssl::context::default_workarounds | ssl::context::no_sslv2);  // | ssl::context::single_dh_use
-		impl->ssl_context->set_password_callback(
-		    [ssl_certificate_password](std::size_t max_length, ssl::context::password_purpose purpose) -> std::string {
-			    return ssl_certificate_password;
-			});
-		impl->ssl_context->use_certificate_chain_file(ssl_pem_file);
-		impl->ssl_context->use_private_key_file(ssl_pem_file, ssl::context::pem);
-		//	impl->ssl_context.use_tmp_dh_file("dh512.pem");
-	}
-#endif
+TCPAcceptor::TCPAcceptor(const std::string &addr, uint16_t port, A_handler &&a_handler) try
+    : impl(std::make_shared<Impl>(this)),
+      a_handler(std::move(a_handler)) {
 	boost::asio::ip::tcp::resolver resolver(EventLoop::current()->io());
-	boost::asio::ip::tcp::resolver::query query(addr, std::to_string(port));
+	boost::asio::ip::tcp::resolver::query query(addr, common::to_string(port));
 	boost::asio::ip::tcp::endpoint endpoint = *resolver.resolve(query);
 	impl->acceptor.open(endpoint.protocol());
 	impl->acceptor.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
@@ -838,6 +947,9 @@ TCPAcceptor::TCPAcceptor(const std::string &addr, uint16_t port, A_handler a_han
 	impl->acceptor.listen();
 
 	impl->start_accept();
+} catch (const boost::system::system_error &) {
+	std::throw_with_nested(AddressInUse("Failed to create TCP listening socket, probably address in use addr=" + addr +
+	                                    " port=" + common::to_string(port)));
 }
 
 TCPAcceptor::~TCPAcceptor() { impl->close(); }
@@ -852,34 +964,147 @@ bool TCPAcceptor::accept(TCPSocket &socket, std::string &accepted_addr) {
 	socket.close();
 	std::swap(socket.impl->socket, impl->socket_being_accepted);
 	boost::system::error_code ec;
-#if platform_USE_SSL
-	std::swap(socket.impl->ssl_socket, impl->ssl_socket_being_accepted);
-	auto endpoint =
-	    impl->ssl ? socket.impl->ssl_socket->next_layer().remote_endpoint(ec) : socket.impl->socket.remote_endpoint(ec);
-#else
 	auto endpoint = socket.impl->socket.remote_endpoint(ec);
-#endif
 
 	if (ec) {
 		impl->start_accept();
 		return false;
 	}
-	accepted_addr = endpoint.address().to_string();
-#if platform_USE_SSL
-	if (impl->ssl) {
-		if (!impl->ssl_socket_being_accepted)
-			impl->ssl_socket_being_accepted =
-			    std::make_unique<SSLSocket>(EventLoop::current()->io(), *impl->ssl_context);
-		socket.impl->ssl_context = impl->ssl_context;
-		socket.impl->start_handshake(ssl::stream_base::server);
-	} else
-#endif
-	{
-		socket.impl->connected = true;
-		socket.impl->start_read();
-	}
+	accepted_addr          = endpoint.address().to_string();
+	socket.impl->connected = true;
+	socket.impl->set_keepalive();
+	socket.impl->start_read();
 	impl->start_accept();
 	return true;
+}
+
+std::vector<std::string> TCPAcceptor::local_addresses(bool ipv4, bool ipv6) {
+	std::vector<std::string> result;
+#ifndef _WIN32  // TODO - get adapters info on Win32
+	struct ifaddrs *ifaddr = nullptr;
+	if (getifaddrs(&ifaddr) == -1)
+		return result;
+
+	for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+		if (ifa->ifa_addr == NULL)
+			continue;
+		int family = ifa->ifa_addr->sa_family;
+		;
+		if (family != AF_INET && family != AF_INET6)
+			continue;
+		char host[NI_MAXHOST]{};
+		int s =
+		    getnameinfo(ifa->ifa_addr, (family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6),
+		        host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+		if (s == 0 && ipv4 && family == AF_INET)
+			result.push_back(host);
+		if (s == 0 && ipv6 && family == AF_INET6)
+			result.push_back(host);
+	}
+	freeifaddrs(ifaddr);
+#endif
+	return result;
+}
+
+class UDPMulticast::Impl {
+public:
+	explicit Impl(UDPMulticast *owner) : owner(owner), socket(EventLoop::current()->io()) {}
+	UDPMulticast *owner;
+	boost::asio::ip::udp::socket socket;
+	boost::asio::ip::udp::endpoint sender_endpoint;
+	enum { max_length = 1024 };
+	unsigned char data[max_length];
+	bool pending_read = false;
+
+	void close() {
+		socket.close();
+		UDPMulticast *was_owner = owner;
+		owner                   = nullptr;
+		if (pending_read) {
+			if (was_owner)                // error can happen on detached impl
+				was_owner->impl.reset();  // We do not reuse UDP Multicasts
+		}
+	}
+	void start_read() {
+		if (!owner)
+			return;
+		pending_read = true;
+		socket.async_receive_from(
+		    boost::asio::buffer(data, max_length), sender_endpoint, std::bind(&Impl::handle_read, owner->impl, _1, _2));
+	}
+	void handle_read(const boost::system::error_code &e, size_t bytes_recvd) {
+		pending_read = false;
+		if (!e) {
+			std::string sender_addr = sender_endpoint.address().to_string();
+			std::vector<unsigned char> data_copy(data, data + bytes_recvd);
+			if (owner) {
+				start_read();  // Can modify sender_endpoint and data here
+				owner->p_handler(sender_addr, data_copy.data(), data_copy.size());
+			}
+		}
+		if (e != boost::asio::error::operation_aborted) {
+			// some nasty problem with socket, say so to the client
+		}
+	}
+};
+
+UDPMulticast::UDPMulticast(const std::string &addr, uint16_t port, P_handler &&p_handler)
+    : impl(std::make_shared<Impl>(this)), p_handler(std::move(p_handler)) {
+	try {
+		// Multiple processes can only bind to multicast socket if listen_ad is multicast addr
+		boost::asio::ip::address listen_ad = boost::asio::ip::address::from_string(addr);
+		boost::asio::ip::address group_ad  = boost::asio::ip::address::from_string(addr);
+		boost::asio::ip::udp::endpoint listen_endpoint(listen_ad, port);
+		impl->socket.open(listen_endpoint.protocol());
+		impl->socket.set_option(boost::asio::ip::udp::socket::reuse_address(true));
+
+		//		boost::asio::ip::multicast::enable_loopback option;
+		//		impl->socket.get_option(option);
+		//		bool is_set = option.value();
+
+		//		impl->socket.set_option(boost::asio::ip::multicast::enable_loopback(false));
+
+		impl->socket.bind(listen_endpoint);
+
+		impl->socket.set_option(boost::asio::ip::multicast::join_group(group_ad));
+		impl->start_read();
+
+		//		auto local_addresses = TCPAcceptor::local_addresses(true, false);
+		//		for (const auto &la : local_addresses)
+		//			std::cout << "UDPMulticast::UDPMulticast listening on local address " << la << std::endl;
+	} catch (const std::exception &) {
+		//		std::cout << "UDPMulticast::UDPMulticast exception " << common::what(ex) << std::endl;
+	}
+}
+UDPMulticast::~UDPMulticast() { impl->close(); }
+void UDPMulticast::send(const std::string &addr, uint16_t port, const void *data, size_t size) {
+	try {
+		// Multicast will not work on loopback
+		{
+		    //			boost::asio::ip::address local_ad = boost::asio::ip::address::from_string("127.0.0.1");
+		    //			boost::asio::ip::udp::endpoint local_ep(local_ad, port);
+		    //			boost::asio::ip::udp::socket local_socket(EventLoop::current()->io(), local_ep.protocol());
+		    //			local_socket.send_to(boost::asio::buffer(data, size), local_ep);
+		} {
+			boost::asio::ip::address ad = boost::asio::ip::address::from_string(addr);
+			boost::asio::ip::udp::endpoint ep(ad, port);
+			boost::asio::ip::udp::socket socket(EventLoop::current()->io(), ep.protocol());
+
+			//			socket.set_option(boost::asio::ip::multicast::enable_loopback(true));
+			//			socket.set_option(boost::asio::ip::multicast::hops(2));
+			auto local_addresses = TCPAcceptor::local_addresses(true, false);
+			for (const auto &la : local_addresses) {
+				boost::asio::ip::address_v4 local_interface = boost::asio::ip::address_v4::from_string(la);
+				socket.set_option(boost::asio::ip::multicast::outbound_interface(local_interface));
+				socket.send_to(boost::asio::buffer(data, size), ep);
+			}
+			if (local_addresses.empty())  // Send on default gateway
+				socket.send_to(boost::asio::buffer(data, size), ep);
+		}
+	} catch (const std::exception &) {
+		//		std::cout << "UDPMulticast::send exception to addr=" << addr << " port=" << port
+		//		          << " error=" << common::what(ex) << std::endl;
+	}
 }
 
 #endif  // #if TARGET_OS_IPHONE

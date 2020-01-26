@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include "Files.hpp"  // For OpenMode
 #include "common/BinaryArray.hpp"
 #include "common/Nocopy.hpp"
 
@@ -52,19 +53,24 @@ struct Cur : private common::Nocopy {
 };
 class Error : public std::runtime_error {
 public:
-	explicit Error(const std::string &msg) : std::runtime_error(msg) {}
+	using std::runtime_error::runtime_error;
+	static void do_throw(const std::string &msg, int rc);
 };
-}
+}  // namespace lmdb
 
 class DBlmdb {
-	const std::string full_path; // TODO - change fields to m_
+	const std::string full_path;  // TODO - change fields to m_
 	lmdb::Env db_env;
 	std::unique_ptr<lmdb::Dbi> db_dbi;
 	std::unique_ptr<lmdb::Txn> db_txn;
-public:
-	explicit DBlmdb(bool read_only, const std::string &full_path,
-	    uint64_t max_db_size = 0x8000000000);  // 0.5 Tb default, out of total 4 Tb on windows
 
+	uint64_t max_tx_size;
+	void resize_and_begin_tx();
+
+public:
+	explicit DBlmdb(OpenMode open_mode, const std::string &full_path,
+	    uint64_t max_tx_size = 0x100000000);  // 4 Gb default
+	const std::string &get_path() const { return full_path; }
 	void commit_db_txn();
 	size_t test_get_approximate_size() const;
 	size_t get_approximate_items_count() const;
@@ -100,8 +106,8 @@ public:
 		void next();
 		void erase();  // moves to the next value
 	};
-	Cursor begin(const std::string &prefix, const std::string &middle = std::string()) const;
-	Cursor rbegin(const std::string &prefix, const std::string &middle = std::string()) const;
+	Cursor begin(const std::string &prefix, const std::string &middle = std::string{}, bool forward = true) const;
+	Cursor rbegin(const std::string &prefix, const std::string &middle = std::string{}) const;
 
 	static std::string to_binary_key(const unsigned char *data, size_t size) {
 		std::string result;
@@ -120,5 +126,7 @@ public:
 	static void run_tests();
 	static void delete_db(const std::string &full_path);
 	static void backup_db(const std::string &full_path, const std::string &dst_path);
+
+	void debug_print_index_size(const std::string &prefix);
 };
-}
+}  // namespace platform
