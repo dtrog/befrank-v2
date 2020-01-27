@@ -3,9 +3,9 @@
 // details.
 
 #include "../Random.hpp"
-#include "Core/BlockChain.hpp"
-#include "Core/Config.hpp"
-#include "Core/WalletState.hpp"
+#include "core/BlockChain.hpp"
+#include "core/Config.hpp"
+#include "core/WalletState.hpp"
 #include "logging/ConsoleLogger.hpp"
 #include "platform/PathTools.hpp"
 

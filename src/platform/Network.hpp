@@ -141,7 +141,7 @@ private:
 }  // namespace platform
 #elif TARGET_OS_IPHONE
 #include <CFNetwork/CFNetwork.h>
-#include <CoreFoundation/CoreFoundation.h>
+#include <coreFoundation/coreFoundation.h>
 
 namespace platform {
 class EventLoop {

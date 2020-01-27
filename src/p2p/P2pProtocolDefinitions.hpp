@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "Core/CryptoNoteTools.hpp"
+#include "core/CryptoNoteTools.hpp"
 #include "CryptoNote.hpp"
 #include "CryptoNoteConfig.hpp"
 #include "LevinProtocol.hpp"
@@ -22,7 +22,7 @@ struct Handshake {
 	struct Request {
 		enum { ID = P2P_COMMANDS_POOL_BASE + 1, TYPE = LevinProtocol::REQUEST, MAX_SIZE = 1024 };
 		BasicNodeData node_data;
-		CoreSyncData payload_data;
+		coreSyncData payload_data;
 	};
 
 	struct Response {
@@ -34,7 +34,7 @@ struct Handshake {
 			MAX_SIZE            = 1024 + MAX_PEER_COUNT * sizeof(PeerlistEntryLegacy)  // Update in V5
 		};
 		BasicNodeData node_data;
-		CoreSyncData payload_data;
+		coreSyncData payload_data;
 		std::vector<PeerlistEntryLegacy> local_peerlist;  // Remove in V5
 		std::vector<NetworkAddress> peerlist;
 	};
@@ -43,7 +43,7 @@ struct Handshake {
 struct TimedSync {   // TODO - rename to TopBlockUpdated
 	struct Notify {  // has type request for historic purposes
 		enum { ID = P2P_COMMANDS_POOL_BASE + 2, TYPE = LevinProtocol::REQUEST, MAX_SIZE = 1024 };
-		CoreSyncData payload_data;
+		coreSyncData payload_data;
 	};
 
 	struct Response {  // Remove in V5
@@ -53,7 +53,7 @@ struct TimedSync {   // TODO - rename to TopBlockUpdated
 			MAX_PEER_COUNT = 50,
 			MAX_SIZE       = 1024 + MAX_PEER_COUNT * sizeof(PeerlistEntryLegacy)
 		};
-		CoreSyncData payload_data;
+		coreSyncData payload_data;
 		// TODO - we sent peer list here in V1-V4, hence non-trivial MAX_SIZE
 	};
 };
@@ -181,10 +181,10 @@ struct GetStatInfo {
 		bool need_peer_lists = false;
 	};
 
-	struct Response : public CoreStatistics {
+	struct Response : public coreStatistics {
 		enum { ID = P2P_COMMANDS_POOL_BASE + 4, TYPE = LevinProtocol::RESPONSE, MAX_SIZE = 1 * 1024 * 1024 };
 		Response() = default;
-		Response(const CoreStatistics &c) : CoreStatistics(c) {}  // implicit
+		Response(const coreStatistics &c) : coreStatistics(c) {}  // implicit
 	};
 };
 
@@ -210,7 +210,7 @@ inline void ser_members(cn::p2p::Checkpoint::Notify &v, seria::ISeria &s) {
 void ser_members(cn::p2p::ProofOfTrust &v, seria::ISeria &s);
 void ser_members(cn::p2p::GetStatInfo::Request &v, seria::ISeria &s);
 inline void ser_members(cn::p2p::GetStatInfo::Response &v, seria::ISeria &s) {
-	ser_members(static_cast<cn::CoreStatistics &>(v), s);
+	ser_members(static_cast<cn::coreStatistics &>(v), s);
 }
 #endif
 }  // namespace seria

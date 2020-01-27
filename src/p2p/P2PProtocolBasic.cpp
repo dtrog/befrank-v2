@@ -3,7 +3,7 @@
 
 #include "P2PProtocolBasic.hpp"
 #include <iostream>
-#include "Core/Config.hpp"
+#include "core/Config.hpp"
 #include "platform/Time.hpp"
 
 using namespace cn;
@@ -106,7 +106,7 @@ void P2PProtocolBasic::on_disconnect(const std::string &ban_reason) {
 	no_incoming_timer.cancel();
 	peer_version                            = P2PProtocolVersion::NO_HANDSHAKE_YET;
 	first_message_after_handshake_processed = false;
-	set_peer_sync_data(CoreSyncData{});
+	set_peer_sync_data(coreSyncData{});
 	peer_unique_number = 0;
 }
 

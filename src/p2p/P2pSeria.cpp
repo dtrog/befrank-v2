@@ -57,7 +57,7 @@ void ser_members(NetworkAddressLegacy &v, seria::ISeria &s) {
 	seria_kv("port", v.port, s);
 }
 
-void ser_members(CoreStatistics &v, seria::ISeria &s) {
+void ser_members(coreStatistics &v, seria::ISeria &s) {
 	seria_kv("version", v.version, s);
 	seria_kv("platform", v.platform, s);
 	seria_kv("net", v.net, s);
@@ -97,7 +97,7 @@ void ser_kv_plus1(common::StringView name, Height &v, seria::ISeria &s) {
 		ser(on_wire, s);
 	}
 }
-void ser_members(CoreSyncData &v, seria::ISeria &s) {
+void ser_members(coreSyncData &v, seria::ISeria &s) {
 	ser_kv_plus1("current_height", v.current_height, s);
 	auto height = v.current_height;
 	// TODO - in V5, remove serialization as current_height
@@ -137,7 +137,7 @@ void ser_members(p2p::GetStatInfo::Request &v, seria::ISeria &s) {
 
 void ser_members(p2p::RelayBlock::Notify &v, seria::ISeria &s) {
 	seria_kv("b", v.b, s);
-	CoreSyncData payload_data{v.current_blockchain_height, v.top_id};
+	coreSyncData payload_data{v.current_blockchain_height, v.top_id};
 	seria_kv("payload_data", payload_data, s);
 	// In 3.5.1 we added payload_data, will get rid of other fields later
 	ser_kv_plus1("current_blockchain_height", v.current_blockchain_height, s);

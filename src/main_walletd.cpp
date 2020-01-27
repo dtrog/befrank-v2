@@ -4,11 +4,11 @@
 #include <boost/algorithm/string.hpp>
 #include <future>
 #include <random>
-#include "Core/Config.hpp"
-#include "Core/Node.hpp"
-#include "Core/WalletHDsqlite.hpp"
-#include "Core/WalletLegacy.hpp"
-#include "Core/WalletNodeExt.hpp"
+#include "core/Config.hpp"
+#include "core/Node.hpp"
+#include "core/WalletHDsqlite.hpp"
+#include "core/WalletLegacy.hpp"
+#include "core/WalletNodeExt.hpp"
 #include "common/BIPs.hpp"
 #include "common/Base64.hpp"
 #include "common/CommandLine.hpp"

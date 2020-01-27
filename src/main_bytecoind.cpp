@@ -1,10 +1,10 @@
 // Copyright (c) 2012-2018, The CryptoNote developers, The Bytecoin developers.
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
-#include "Core/BlockChainFileFormat.hpp"
-#include "Core/Config.hpp"
-#include "Core/Currency.hpp"
-#include "Core/Node.hpp"
+#include "core/BlockChainFileFormat.hpp"
+#include "core/Config.hpp"
+#include "core/Currency.hpp"
+#include "core/Node.hpp"
 #include "common/CommandLine.hpp"
 #include "common/ConsoleTools.hpp"
 #include "logging/ConsoleLogger.hpp"
@@ -16,12 +16,12 @@
 
 using namespace cn;
 
-static const char USAGE[] = R"(bytecoind )" bytecoin_VERSION_STRING R"(.
+static const char USAGE[] = R"(befrankd )" bytecoin_VERSION_STRING R"(.
 
 Usage:
-  bytecoind [options]
-  bytecoind --help | -h
-  bytecoind --version | -v
+  befrankd [options]
+  befrankd --help | -h
+  befrankd --version | -v
 
 Options:
   --p2p-bind-address=<ip:port>           IP and port for P2P network protocol [default: 0.0.0.0:8080].
@@ -33,8 +33,8 @@ Options:
   --data-folder=<folder-path>            Folder for blockchain, logs and peer DB [default: %appdata%/bytecoin].
   --backup-blockchain=<folder-path>      Perform hot backup of blockchain into specified backup data folder, then exit.
   --net=<main|stage|test>                Configure for mainnet or testnet [default: main].
-  --bytecoind-authorization=<usr:pass>   HTTP basic authentication credentials for RPC API.
-  --bytecoind-authorization-private=<usr:pass>   HTTP basic authentication credentials for get_statistics and get_archive methods.
+  --befrankd-authorization=<usr:pass>   HTTP basic authentication credentials for RPC API.
+  --bbefrankd-authorization-private=<usr:pass>   HTTP basic authentication credentials for get_statistics and get_archive methods.
   --import-blocks=<folder-path>          Perform import of blockchain from specified folder as blocks.bin and blockindexes.bin, then exit.
   --export-blocks=<folder-path>          Perform hot export of blockchain into specified folder as blocks.bin and blockindexes.bin, then exit. This overwrites existing files.
   --archive                              Work as an archive node [default: off].
@@ -134,7 +134,7 @@ int main(int argc, const char *argv[]) try {
 	Node node(log_manager, config, block_chain);
 	const auto idea_ms =
 	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - idea_start);
-	std::cout << "bytecoind started seconds=" << double(idea_ms.count()) / 1000 << std::endl;
+	std::cout << "befrankd started seconds=" << double(idea_ms.count()) / 1000 << std::endl;
 	while (!io.stopped()) {
 		if (node.on_idle())  // Using it to load blockchain
 			io.poll();
@@ -143,7 +143,7 @@ int main(int argc, const char *argv[]) try {
 	}
 	return 0;
 } catch (const platform::ExclusiveLock::FailedToLock &ex) {
-	std::cout << "Bytecoind already running - " << common::what(ex) << std::endl;
+	std::cout << "befrankd already running - " << common::what(ex) << std::endl;
 	return api::BYTECOIND_ALREADY_RUNNING;
 } catch (const cn::Config::DataFolderError &ex) {
 	std::cout << common::what(ex) << std::endl;

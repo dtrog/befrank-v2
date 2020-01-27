@@ -2695,7 +2695,7 @@ SQLITE_API char *sqlite3_vsnprintf(int,char*,const char*, va_list);
 ** CAPI3REF: Memory Allocation Subsystem
 **
 ** The SQLite core uses these three routines for all of its own
-** internal memory allocation needs. "Core" in the previous sentence
+** internal memory allocation needs. "core" in the previous sentence
 ** does not include operating-system specific VFS implementation.  The
 ** Windows VFS uses native malloc() and free() for some operations.
 **

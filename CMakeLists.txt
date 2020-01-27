@@ -2,10 +2,10 @@
 # Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 cmake_minimum_required(VERSION 3.0)
-project(bytecoin)
+project(befrank)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_C_STANDARD 11)
-set(CRYPTONOTE_NAME bytecoin)
+set(CRYPTONOTE_NAME befrank)
 add_definitions(-DCRYPTONOTE_NAME=\"${CRYPTONOTE_NAME}\" -DNDEBUG=1)
 message("SANITIZE adds clang sanitizer options. Examples thread or address,undefined or fuzzer,address,undefined")
 option(BETTER_DEBUG "Disables optimizations. We do not use standard debug/realease configurations because they change too much" OFF)
@@ -100,9 +100,9 @@ file(GLOB SRC_COMMON src/common/*.cpp src/common/*.hpp)
 file(GLOB SRC_SERIA src/seria/*.cpp src/seria/*.hpp)
 file(GLOB SRC_LOGGING src/logging/*.cpp src/logging/*.hpp)
 file(GLOB SRC_P2P src/p2p/*.cpp src/p2p/*.hpp)
-file(GLOB SRC_CORE src/Core/*.cpp src/Core/*.hpp
-        src/Core/hardware/*.cpp src/Core/hardware/*.hpp
-        src/Core/hardware/trezor/*.cpp src/Core/hardware/trezor/*.hpp
+file(GLOB SRC_CORE src/core/*.cpp src/core/*.hpp
+        src/core/hardware/*.cpp src/core/hardware/*.hpp
+        src/core/hardware/trezor/*.cpp src/core/hardware/trezor/*.hpp
         src/CryptoNote.hpp src/CryptoNote.cpp
         src/rpc_api.hpp src/rpc_api.cpp
         vendor/hmac/*.h vendor/hmac/*.c)
@@ -174,14 +174,14 @@ set(SOURCE_FILES
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/libs")
-add_library(bytecoin-crypto ${SRC_CRYPTO})
+add_library(befrank-crypto ${SRC_CRYPTO})
 if(APPLE)
     link_libraries(-dead_strip  "-framework Foundation")
 endif()
-add_library(bytecoin-core ${SOURCE_FILES})
-target_link_libraries(bytecoin-core bytecoin-crypto ${HID_LIBRARY})
+add_library(befrank-core ${SOURCE_FILES})
+target_link_libraries(befrank-core befrank-crypto ${HID_LIBRARY})
 
-link_libraries(bytecoin-crypto bytecoin-core)
+link_libraries(befrank-crypto befrank-core)
 if(NOT WIN32)
     link_libraries(${LINK_OPENSSL} dl pthread)
 endif()

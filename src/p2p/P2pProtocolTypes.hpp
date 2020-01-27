@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "Core/Difficulty.hpp"
+#include "core/Difficulty.hpp"
 #include "CryptoNote.hpp"
 #include "common/Ipv4Address.hpp"
 #include "common/StringTools.hpp"
@@ -51,7 +51,7 @@ struct BasicNodeData {
 	PeerIdType peer_id   = 0;
 };
 
-struct CoreSyncData {
+struct coreSyncData {
 	Height current_height = 0;  // crazy, but this one is top block + 1 instead of top block
 	// We conform to legacy by sending incremented field on wire
 	Hash top_id;
@@ -87,7 +87,7 @@ struct ConnectionDesc {
 	TopBlockDesc top_block_desc;
 };
 
-struct CoreStatistics {
+struct coreStatistics {
 	std::string version;
 	std::string platform;
 	Timestamp start_time = 0;  // Unix timestamp UTC
@@ -123,11 +123,11 @@ CRYPTO_MAKE_COMPARABLE(UUID, std::memcmp)
 namespace seria {
 bool ser(cn::UUID &v, seria::ISeria &s);
 void ser_members(cn::BasicNodeData &v, seria::ISeria &s);
-void ser_members(cn::CoreSyncData &v, seria::ISeria &s);
+void ser_members(cn::coreSyncData &v, seria::ISeria &s);
 void ser_members(cn::TransactionDesc &v, seria::ISeria &s);
 void ser_members(cn::PeerlistEntryLegacy &v, seria::ISeria &s);
 void ser_members(cn::NetworkAddressLegacy &v, seria::ISeria &s);
-void ser_members(cn::CoreStatistics &v, seria::ISeria &s);
+void ser_members(cn::coreStatistics &v, seria::ISeria &s);
 bool ser(cn::NetworkAddress &v, seria::ISeria &s);
 void ser_members(cn::PeerlistEntry &v, seria::ISeria &s);
 void ser_members(cn::ConnectionDesc &v, seria::ISeria &s);

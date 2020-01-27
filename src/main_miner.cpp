@@ -2,10 +2,10 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include <thread>
-#include "Core/Config.hpp"
-#include "Core/CryptoNoteTools.hpp"
-#include "Core/Difficulty.hpp"
-#include "Core/TransactionExtra.hpp"
+#include "core/Config.hpp"
+#include "core/CryptoNoteTools.hpp"
+#include "core/Difficulty.hpp"
+#include "core/TransactionExtra.hpp"
 #include "CryptoNoteConfig.hpp"
 #include "common/CommandLine.hpp"
 #include "common/ConsoleTools.hpp"

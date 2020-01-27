@@ -2,8 +2,8 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include "rpc_api.hpp"
-#include "Core/CryptoNoteTools.hpp"
-#include "Core/TransactionExtra.hpp"
+#include "core/CryptoNoteTools.hpp"
+#include "core/TransactionExtra.hpp"
 #include "common/StringTools.hpp"
 #include "common/Varint.hpp"
 #include "seria/BinaryInputStream.hpp"

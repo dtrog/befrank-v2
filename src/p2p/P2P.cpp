@@ -6,7 +6,7 @@
 #include <ctime>
 #include <iostream>
 #include <map>
-#include "Core/Config.hpp"
+#include "core/Config.hpp"
 #include "PeerDB.hpp"
 #include "common/Invariant.hpp"
 #include "crypto/crypto.hpp"

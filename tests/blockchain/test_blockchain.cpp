@@ -6,12 +6,12 @@
 
 #include <fstream>
 #include <vector>
-#include "Core/BlockChainState.hpp"
-#include "Core/Config.hpp"
-#include "Core/CryptoNoteTools.hpp"
-#include "Core/Currency.hpp"
-#include "Core/Difficulty.hpp"
-#include "Core/TransactionExtra.hpp"
+#include "core/BlockChainState.hpp"
+#include "core/Config.hpp"
+#include "core/CryptoNoteTools.hpp"
+#include "core/Currency.hpp"
+#include "core/Difficulty.hpp"
+#include "core/TransactionExtra.hpp"
 #include "common/Varint.hpp"
 #include "crypto/crypto.hpp"
 #include "logging/ConsoleLogger.hpp"

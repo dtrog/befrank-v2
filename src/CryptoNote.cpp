@@ -2,8 +2,8 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for details.
 
 #include "CryptoNote.hpp"
-#include "Core/CryptoNoteTools.hpp"
-#include "Core/TransactionExtra.hpp"
+#include "core/CryptoNoteTools.hpp"
+#include "core/TransactionExtra.hpp"
 #include "CryptoNoteConfig.hpp"  // We access TRANSACTION_VERSION_AMETHYST directly
 #include "common/Varint.hpp"
 #include "rpc_api.hpp"

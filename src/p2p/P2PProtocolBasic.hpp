@@ -22,7 +22,7 @@ private:
 	bool first_message_after_handshake_processed = false;
 	// we add node to peerdb after first non-handshake message received to avoid adding seed nodes
 	const uint64_t my_unique_number;
-	CoreSyncData peer_sync_data;
+	coreSyncData peer_sync_data;
 	uint64_t peer_unique_number = 0;
 	Timestamp get_local_time() const;
 	static const std::map<std::pair<uint32_t, LevinProtocol::CommandType>, std::pair<LevinHandlerFunction, size_t>>
@@ -63,13 +63,13 @@ protected:
 	virtual void on_msg_notify_request_objects(p2p::GetObjects::Request &&) {}
 	virtual void on_msg_notify_request_objects(p2p::GetObjects::Response &&) {}
 	virtual void on_msg_notify_checkpoint(p2p::Checkpoint::Notify &&) {}
-	virtual CoreSyncData get_my_sync_data() const = 0;
+	virtual coreSyncData get_my_sync_data() const = 0;
 	virtual std::vector<NetworkAddress> get_peers_to_share() const { return std::vector<NetworkAddress>(); }
 	virtual std::vector<PeerlistEntryLegacy> get_legacy_peers_to_share() const {
 		return std::vector<PeerlistEntryLegacy>();
 	}
 
-	void set_peer_sync_data(CoreSyncData cd) { peer_sync_data = cd; }
+	void set_peer_sync_data(coreSyncData cd) { peer_sync_data = cd; }
 
 public:
 	explicit P2PProtocolBasic(const Config &config, uint64_t my_unique_number, P2PClient *client);
@@ -77,7 +77,7 @@ public:
 	uint64_t get_my_unique_number() const { return my_unique_number; }
 	void send(BinaryArray &&body) override;
 	virtual BasicNodeData get_my_node_data() const;
-	CoreSyncData get_peer_sync_data() const { return peer_sync_data; }
+	coreSyncData get_peer_sync_data() const { return peer_sync_data; }
 	uint64_t get_peer_unique_number() const { return peer_unique_number; }
 
 	static BinaryArray create_multicast_announce(const UUID &network_id, Hash genesis_bid, uint16_t p2p_external_port);

@@ -234,7 +234,7 @@ void TCPSocket::shutdown_both() {
 }
 
 #elif TARGET_OS_IPHONE
-#include <CoreFoundation/CoreFoundation.h>
+#include <coreFoundation/coreFoundation.h>
 #include <sys/socket.h>
 #include "common/MemoryStreams.hpp"
 

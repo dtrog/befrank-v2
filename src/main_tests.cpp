@@ -8,7 +8,7 @@
 #include <sstream>
 #include <thread>
 
-#include "Core/hardware/HardwareWallet.hpp"
+#include "core/hardware/HardwareWallet.hpp"
 #include "common/BIPs.hpp"
 #include "common/Base58.hpp"
 #include "common/CommandLine.hpp"

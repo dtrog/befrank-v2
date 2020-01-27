@@ -5,7 +5,7 @@
 #include <iomanip>
 #include <map>
 #include <sstream>
-#include "Core/Wallet.hpp"
+#include "core/Wallet.hpp"
 #include "crypto/bernstein/crypto-ops.h"
 #include "crypto/crypto_helpers.hpp"
 

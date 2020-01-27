@@ -2,10 +2,10 @@
 // Licensed under the GNU Lesser General Public License. See LICENSE for
 // details.
 
-#include "Core/Config.hpp"
-#include "Core/Wallet.hpp"
-#include "Core/WalletHD.hpp"
-#include "Core/WalletLegacy.hpp"
+#include "core/Config.hpp"
+#include "core/Wallet.hpp"
+#include "core/WalletHD.hpp"
+#include "core/WalletLegacy.hpp"
 #include "common/BIPs.hpp"
 #include "common/CommandLine.hpp"
 #include "crypto/crypto.hpp"

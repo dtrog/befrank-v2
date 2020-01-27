@@ -8,12 +8,12 @@
 #include <map>
 #include <string>
 #include <vector>
-#include "Core/Difficulty.hpp"
+#include "core/Difficulty.hpp"
 #include "CryptoNote.hpp"
 #include "common/Int128.hpp"
 #include "crypto/types.hpp"
 #include "http/JsonRpc.hpp"
-#include "p2p/P2pProtocolTypes.hpp"  // For CoreStatistics
+#include "p2p/P2pProtocolTypes.hpp"  // For coreStatistics
 
 // Common data structures used in all api calls.
 
@@ -782,7 +782,7 @@ struct GetStatistics {
 		bool need_connected_peers = true;
 		bool need_peer_lists      = false;
 	};
-	typedef CoreStatistics Response;
+    typedef coreStatistics Response;
 };
 
 // This method is highly experimental
