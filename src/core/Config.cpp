@@ -158,12 +158,21 @@ Config::Config(common::CommandLine &cmd)
 		exclusive_nodes = true;
 		priority_nodes  = exclusive_nodes_list;
 	}
-	if (seed_nodes.empty() && net != "test")
-		for (auto &&sn : net == "stage" ? SEED_NODES_STAGENET : SEED_NODES) {
-			NetworkAddress addr;
-			common::parse_ip_address_and_port(sn, &addr.ip, &addr.port);
-			seed_nodes.push_back(addr);
-		}
+	if (seed_nodes.empty() && net != "test") {
+	    if (net == "stage") {
+            for (auto &&sn : SEED_NODES_STAGENET) {
+                NetworkAddress addr;
+                common::parse_ip_address_and_port(sn, &addr.ip, &addr.port);
+                seed_nodes.push_back(addr);
+            }
+        } else {
+            for (auto &&sn : SEED_NODES) {
+                NetworkAddress addr;
+                common::parse_ip_address_and_port(sn, &addr.ip, &addr.port);
+                seed_nodes.push_back(addr);
+            }
+	    }
+    }
 	std::sort(seed_nodes.begin(), seed_nodes.end());
 	std::sort(priority_nodes.begin(), priority_nodes.end());
 
